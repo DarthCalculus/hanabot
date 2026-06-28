@@ -26,7 +26,9 @@ from .players.random_player import RandomPlayer
 from .players.reactor_deduce_player import (
     ReactorDeducePlayer,
     ReactorDeducePlayPriorityPlayer,
+    ReactorDeferDupPlayer,
     ReactorEndgamePlayer,
+    ReactorGoodTouchPlayer,
 )
 from .players.reactor_player import ReactorPlayer
 from .players.tempo_player import TempoPlayer
@@ -70,6 +72,8 @@ STRATEGIES: dict[str, PlayerFactory] = {
     "rdeduce": lambda ctx: ReactorDeducePlayer(),
     "rdplay": lambda ctx: ReactorDeducePlayPriorityPlayer(),
     "rdend": lambda ctx: ReactorEndgamePlayer(),
+    "rdgt": lambda ctx: ReactorGoodTouchPlayer(),
+    "rddefer": lambda ctx: ReactorDeferDupPlayer(),
 }
 
 # Guard against a strategy that never makes progress.

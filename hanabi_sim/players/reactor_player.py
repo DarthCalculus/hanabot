@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..actions import Action, ActionType
-from ..cards import RANK_COUNTS
+from ..cards import RANK_COUNTS, Card
 from ..game import HAND_SIZE
 from ..observation import Observation
 from .base import Player
@@ -86,6 +86,29 @@ class ReactorPlayer(Player):
     #: Endgame convention: a color clue that fills in the color of a card already
     #: known (by rank) to be a 4 or 5 but not yet color-clued is also a STALL.
     COLOR_FILL_STALL = False
+    #: Experiment: when no normal expected signal exists, allow a reactive clue to
+    #: target Cathy's leftmost card that is *one* away from playable (rank ==
+    #: stack+2), provided the giver can set the reaction up so Bob plays the
+    #: unblocking card (rank stack+1) -- which makes Cathy's card playable by her
+    #: turn. If no such reaction exists, no reactive clue is given.
+    REACTIVE_ONE_AWAY = False
+
+    #: Experiment (NOT adopted -- A/B within noise): when choosing among our own
+    #: plays, only let a DEDUCED play outrank our signalled plays if no signalled
+    #: card in our own hand could be a duplicate of it. If one might be, play the
+    #: signalled (unknown) card first -- we can still re-verify the deduced (known)
+    #: card next turn, but not vice versa (we'd blind-bomb the stale signal).
+    #: Logically sound, but A/B (20k) 77.26% -> 77.36% perfect (within ~0.3pp
+    #: noise) and +0.01pp strikeout: the dup strikes it avoids are mostly harmless.
+    DEDUCE_DEFER_DUP_SIGNAL = False
+
+    #: Experiment (NOT adopted -- A/B neutral-to-negative): giver-side good-touch,
+    #: never create a play-signal on a card whose duplicate the holder can ALREADY
+    #: deduce-play on their own. It targets the dominant non-gamble strike cause,
+    #: but A/B (20k) was 77.26% -> 76.94% perfect: those duplicate strikes are
+    #: mostly harmless (the game is usually still won) and refusing the clue loses
+    #: more tempo than the rare strike costs. Giver-side only / sound; left off.
+    GOODTOUCH_DEDUCIBLE_DUP = False
 
     # ==================================================================
     #  Turn entry point
@@ -405,7 +428,12 @@ class ReactorPlayer(Player):
     #  Expected signal / trash (need visible cards; never our own hand)
     # ==================================================================
     def _expected_signal(self, obs: Observation, who: int, r: _Derived) -> tuple | None:
-        """Cathy's expected signal: (action, slot, order), or None.
+        """Cathy's expected signal: (action, slot, order, intermediate), or None.
+
+        ``intermediate`` is None except for the optional "1-away" case (see
+        REACTIVE_ONE_AWAY): then it is the Card Bob must play to unblock Cathy's
+        targeted card, and the giver must arrange for Bob's reaction to be exactly
+        that play.
 
         CRUCIAL: this must be identical for Alice (giver) and Bob (reactor), who
         otherwise compute different slides and Bob plays an unverified card. So it
@@ -430,7 +458,7 @@ class ReactorPlayer(Player):
                 continue
             s = slots[cv.order]
             if best is None or s < best[1]:
-                best = ("play", s, cv.order)
+                best = ("play", s, cv.order, None)
         if best is not None:
             return best
 
@@ -444,8 +472,32 @@ class ReactorPlayer(Player):
                 continue
             s = slots[cv.order]
             if trash is None or s < trash[1]:
-                trash = ("discard", s, cv.order)
-        return trash
+                trash = ("discard", s, cv.order, None)
+        if trash is not None:
+            return trash
+
+        # Last resort (opt-in): the leftmost card that is one play away from being
+        # playable. Cathy will play it on her turn -- which only works if Bob's
+        # reaction is to play the unblocking card first (enforced by the giver in
+        # _reactive_clue). ``intermediate`` is that unblocking card.
+        if self.REACTIVE_ONE_AWAY:
+            near = None
+            for cv in hand:
+                if cv.card is None:
+                    continue
+                if cv.card.rank != obs.play_stacks[cv.card.color] + 2:
+                    continue  # not exactly one away from playable
+                if cv.order in r.sig_play:
+                    continue
+                if (cv.card.color, cv.card.rank) in psig_ids:
+                    continue
+                s = slots[cv.order]
+                inter = Card(cv.card.color, cv.card.rank - 1)
+                if near is None or s < near[1]:
+                    near = ("play", s, cv.order, inter)
+            if near is not None:
+                return near
+        return None
 
     @staticmethod
     def _is_trash(obs: Observation, order: int, card, r: _Derived) -> bool:
@@ -538,6 +590,18 @@ class ReactorPlayer(Player):
 
         chand = obs.hands[cathy]
         corders = [cv.order for cv in chand]
+
+        # Giver-side good-touch: if Cathy can already deduce-play a copy of the
+        # card this clue would signal, don't signal it (she'd play the deducible
+        # copy and strike on this one). Alice-only filter; never touches decoding.
+        if self.GOODTOUCH_DEDUCIBLE_DUP and self.ASSUME_TEAMMATES_DEDUCE \
+                and e_card is not None:
+            cathy_deduced_ids = {
+                cv.card for cv in chand
+                if cv.order in self._other_deducible_plays(obs, r, cathy)
+            }
+            if e_card in cathy_deduced_ids:
+                return None
         bhand = obs.hands[bob]
         bslots, bby = self._hand_slots([cv.order for cv in bhand])
         bcard = {cv.order: cv.card for cv in bhand}
@@ -546,6 +610,16 @@ class ReactorPlayer(Player):
         leftmost_nopsig = min(
             (bslots[cv.order] for cv in bhand if cv.order not in r.sig_play),
             default=99)
+
+        # Cards already signalled to play in Bob's or Cathy's hand (order +
+        # identity). Bob must never react by PLAYING a duplicate of one of these:
+        # finishing his copy would strand the already-signalled copy as a dead
+        # card (the cause of the seed-10237 strikeouts).
+        signalled_plays = [
+            (cv.order, (cv.card.color, cv.card.rank))
+            for hand in (bhand, chand) for cv in hand
+            if cv.order in r.sig_play and cv.card is not None
+        ]
 
         # Bob's cards he can already prove playable himself: prefer NOT spending
         # his reaction on one of these (he'd play it on his own anyway).
@@ -576,7 +650,18 @@ class ReactorPlayer(Player):
                 continue
             order = bby[bslot]
             card = bcard[order]
-            if not flip:
+            # A play-reaction must not finish a duplicate of a card already
+            # signalled to play elsewhere (it would kill the signalled copy).
+            if not flip and any(o != order and ident == (card.color, card.rank)
+                                for o, ident in signalled_plays):
+                continue
+            intermediate = E[3]
+            if intermediate is not None:
+                # 1-away: Bob's reaction must be to PLAY exactly the unblocking
+                # card, so Cathy's targeted card is playable by her turn.
+                if flip or card != intermediate:
+                    continue
+            elif not flip:
                 if not obs.is_playable(card):
                     continue
                 # Bob's reaction-play must not be the same card Cathy will play
@@ -680,6 +765,12 @@ class ReactorPlayer(Player):
                 # Skip if Bob can already prove this card playable on his own.
                 if any(o in deducible for o in plays):
                     continue
+                # ...or if a DUPLICATE of it is deducible in Bob's hand: he'd
+                # play that copy and strike on this one later.
+                if self.GOODTOUCH_DEDUCIBLE_DUP:
+                    deduced_ids = {cardof[o2] for o2 in deducible}
+                    if any(cardof[o] in deduced_ids for o in plays):
+                        continue
                 key = (min(slots[o] for o in plays), min(cardof[o].rank for o in plays))
             else:
                 discs = [o for o, act in sig if act == "discard"]

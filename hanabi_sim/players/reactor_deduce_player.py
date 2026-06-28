@@ -49,6 +49,17 @@ class ReactorDeducePlayer(ReactorPlayer):
                 continue  # not provably playable right now
             if any(ident in signalled_ids for ident in remaining):
                 continue  # could be a copy of a card already going to be played
+            # A signalled card in OUR OWN hand is hidden, so the check above can't
+            # see it. If one might be a duplicate of this deduced card, defer the
+            # deduced (known) play and let the signalled (unknown) one go first:
+            # afterwards we can still re-verify this card and skip it if its stack
+            # moved -- whereas the reverse order would blind-bomb the stale signal.
+            if self.DEDUCE_DEFER_DUP_SIGNAL and any(
+                j != i and own[j].order in r.sig_play
+                and set(remaining) & set(self._remaining_identities(obs, j, elsewhere))
+                for j in range(len(own))
+            ):
+                continue
             s = slots[cv.order]
             if best is None or s < best[0]:
                 best = (s, i)
@@ -97,6 +108,13 @@ class ReactorEndgamePlayer(ReactorDeducePlayer):
     #: Adopted: last-turn gamble for an otherwise-lost playable. A/B (20k): +0.8pp
     #: winrate, +0.028 mean, still 0% strikeout.
     LAST_TURN_GAMBLE = True
+
+    #: Adopted: 1-away reactive clues -- when Cathy has no playable/trash, a
+    #: reactive clue can target her leftmost card one play from playable, with
+    #: Bob's reaction playing the unblocking card (two plays from one clue). A/B
+    #: (20k, same seed): 75.83% -> 77.11% perfect (+1.28pp), +0.028 mean, +0.01pp
+    #: strikeout (a rare stale 1-away signal).
+    REACTIVE_ONE_AWAY = True
 
     #: Adopted: among 4-stalls, prefer ones that fill a still-useful (non-dead) 4
     #: over ones that only fill dead 4s. 5-stalls stay on top. A/B (2 seeds, 4000):
@@ -215,3 +233,22 @@ class ReactorEndgamePlayer(ReactorDeducePlayer):
             if st is not None:
                 return st
         return self._fallback(obs, r)
+
+
+class ReactorGoodTouchPlayer(ReactorEndgamePlayer):
+    """Experiment (NOT adopted): rdend + giver-side good-touch against deducible
+    duplicates (GOODTOUCH_DEDUCIBLE_DUP). A/B (20k) 77.26% -> 76.94% perfect --
+    the duplicate strikes it prevents are mostly harmless, and refusing those
+    clues loses more tempo than it saves. Kept registered for reproducibility."""
+
+    name = "rdgt"
+    GOODTOUCH_DEDUCIBLE_DUP = True
+
+
+class ReactorDeferDupPlayer(ReactorEndgamePlayer):
+    """Experiment: rdend + DEDUCE_DEFER_DUP_SIGNAL -- defer a deduced play when an
+    own play-signalled card might be its duplicate, playing the signalled (unknown)
+    card first so the deduced (known) card stays re-checkable afterwards."""
+
+    name = "rddefer"
+    DEDUCE_DEFER_DUP_SIGNAL = True
