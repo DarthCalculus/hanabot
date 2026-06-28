@@ -1,0 +1,4 @@
+# Extra deps for the hanab.live client (run_live.py). The simulator itself
+# needs none of these.
+requests>=2.28
+websocket-client>=1.5

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.coverage
+
+# local editor/agent config
+.claude/
+
+# generated game replays (re-create with `python -m hanabi_sim --replay ...`)
+*.html

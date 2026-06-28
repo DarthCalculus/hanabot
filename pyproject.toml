@@ -1,0 +1,9 @@
+[project]
+name = "hanabi-sim"
+version = "0.1.0"
+description = "A fast, self-contained Hanabi simulator for evaluating strategies."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
