@@ -66,14 +66,6 @@ class ReactorDeducePlayer(ReactorPlayer):
         return None if best is None else Action.play(best[1])
 
 
-class ReactorDeducePlayPriorityPlayer(ReactorDeducePlayer):
-    """Experiment: a stable play-clue outranks discarding a discard-signalled
-    card while >=2 clue tokens remain."""
-
-    name = "rdplay"
-    STABLE_PLAY_BEFORE_DISCARD_AT_2 = True
-
-
 class ReactorEndgamePlayer(ReactorDeducePlayer):
     """rdeduce, but in the endgame (<= ENDGAME_DECK cards left) it front-loads
     play-generating clues over discards, per this flowchart:
@@ -136,9 +128,14 @@ class ReactorEndgamePlayer(ReactorDeducePlayer):
         if not self._in_endgame(obs.deck_size, sum(obs.play_stacks.values()),
                                 obs.num_players, len(obs.colors) * 5):
             return None
+        # When stalls are stable-only, only the next player may be stalled (a
+        # stall to the far player would be misread as a reactive clue).
+        me, nn = obs.player_index, obs.num_players
+        stall_targets = ([(me + 1) % nn] if self.STALLS_STABLE_ONLY
+                         else list(obs.other_players()))
         best = None  # (tier, action)
         for rank in self.STALL_RANKS:
-            for p in obs.other_players():
+            for p in stall_targets:
                 new = [cv for cv in obs.hands[p]
                        if cv.card.rank == rank and r.rank_known.get(cv.order) != rank]
                 if not new:
@@ -235,20 +232,520 @@ class ReactorEndgamePlayer(ReactorDeducePlayer):
         return self._fallback(obs, r)
 
 
-class ReactorGoodTouchPlayer(ReactorEndgamePlayer):
-    """Experiment (NOT adopted): rdend + giver-side good-touch against deducible
-    duplicates (GOODTOUCH_DEDUCIBLE_DUP). A/B (20k) 77.26% -> 76.94% perfect --
-    the duplicate strikes it prevents are mostly harmless, and refusing those
-    clues loses more tempo than it saves. Kept registered for reproducibility."""
+class ReactorScoredPlayer(ReactorEndgamePlayer):
+    """Experiment: score every candidate clue (reactive = expected-signal score +
+    reaction score; stable = its signal's score) and pick by score.
 
-    name = "rdgt"
-    GOODTOUCH_DEDUCIBLE_DUP = True
+    Action value (same scale for a reaction, an expected signal, and a stable
+    signal):
+      PLAY  : +0 if already play-signalled / CK-deducibly playable / a dup of such;
+              +1 if on a touched card or a dup of a touched card;
+              +2 if on an untouched (novel) card.
+      DISCARD: +0 if already discard-signalled or CK-dead trash;
+               else +1 (>=4 clues), +1.5 (2-3 clues), +2 (0-1 clues).
+
+    Flowchart (non-endgame): 1 react, 2 play, 3 best clue scoring >2, 4 discard a
+    discard-signal/trash, 5 best clue scoring >0, 6 discard the chop.
+    """
+
+    name = "rdscore"
+    EXPECTED_SKIP_SIGNALLED = True
+
+    #: Flat value of a discard-signal (telling a holder to dump a non-obvious
+    #: trash). Clue scarcity is NOT priced in here -- it lives in the threshold.
+    DISCARD_CLUE_VALUE = 1.0
+
+    #: Play-signal values. PLAY_NOVEL = a play on an untouched (newly-revealed)
+    #: card; PLAY_TOUCHED = a play on an already-touched card or a dup of one.
+    #: Trying PLAY_TOUCHED = 2.0 (don't distinguish touched plays); was 1.0.
+    PLAY_NOVEL_VALUE = 2.0
+    PLAY_TOUCHED_VALUE = 2.0
+
+    #: Step-3 clue threshold by clue count: a clue is taken over discarding only
+    #: if it scores strictly above this. (>=4, 2-3, 0-1 clues.) A rising schedule
+    #: was swept and did NOT beat a flat 2.0, so it's left flat; kept parameterised
+    #: in case it helps once other gaps close.
+    THRESH_HI = 2.0
+    THRESH_MID = 2.0
+    THRESH_LO = 2.0
+
+    def _step3_threshold(self, clue_tokens: int) -> float:
+        if clue_tokens >= 4:
+            return self.THRESH_HI
+        if clue_tokens >= 2:
+            return self.THRESH_MID
+        return self.THRESH_LO
+
+    # --- action scoring -------------------------------------------------
+    def _play_value(self, obs, r, order, card, deducible, idmap) -> float:
+        pid = (card.color, card.rank)
+        if order in r.sig_play or order in deducible:
+            return 0.0  # already going to be played
+        known_play_ids = ({idmap[o] for o in r.sig_play if o in idmap}
+                          | {idmap[o] for o in deducible if o in idmap})
+        if pid in known_play_ids:
+            return 0.0  # a dup of a card already known to be played
+        if order in r.clued or pid in {idmap[o] for o in r.clued if o in idmap}:
+            return self.PLAY_TOUCHED_VALUE  # touched, or a dup of a touched card
+        return self.PLAY_NOVEL_VALUE  # untouched, novel
+
+    def _discard_value(self, obs, r, order, card, deducible_trash) -> float:
+        # Only trash / duplicates may be discard-signalled -- signalling a discard
+        # of a genuinely useful card is not a legal convention move.
+        if not self._is_trash(obs, order, card, r):
+            return -100.0
+        # +0 only when the discard is already known: already discard-signalled, or
+        # the holder can PROVE it's trash from common knowledge. Otherwise a flat
+        # value -- clue scarcity is handled by the step-3 threshold, NOT here.
+        if order in r.sig_disc or order in deducible_trash:
+            return 0.0
+        return self.DISCARD_CLUE_VALUE
+
+    @staticmethod
+    def _clue_key(c):
+        """Total, process-stable ordering: highest score first, reactive before
+        stable on ties, then by target and clue value -- so selection never
+        depends on (hash-randomised) set iteration order."""
+        score, kind, act = c
+        if act.color is not None:
+            sub = (0, act.color.value, 0)
+        else:
+            sub = (1, "", act.rank or 0)
+        return (-score, kind, act.target, sub)
+
+    # --- scored clue enumeration ---------------------------------------
+    def _clue_candidates(self, obs, r):
+        me, n = obs.player_index, obs.num_players
+        ct = obs.clue_tokens
+        if ct <= 0:
+            return []
+        idmap = {cv.order: (cv.card.color, cv.card.rank)
+                 for p in range(n) if p != me
+                 for cv in obs.hands[p] if cv.card is not None}
+        out = self._stable_candidates(obs, r, idmap, ct)
+        if n == 3:
+            out += self._reactive_candidates(obs, r, idmap, ct)
+        return out
+
+    def _stable_candidates(self, obs, r, idmap, ct):
+        me, n = obs.player_index, obs.num_players
+        bob = (me + 1) % n
+        bhand = obs.hands[bob]
+        borders = [cv.order for cv in bhand]
+        cardof = {cv.order: cv.card for cv in bhand}
+        deducible = self._other_deducible_plays(obs, r, bob)
+        deducible_trash = self._other_deducible_trash(obs, r, bob)
+        in_zone = self._in_endgame(obs.deck_size, sum(obs.play_stacks.values()),
+                                   obs.num_players, len(obs.colors) * 5)
+        options = [(True, c, None) for c in {cv.card.color for cv in bhand}]
+        options += [(False, None, rk) for rk in {cv.card.rank for cv in bhand}]
+        out = []
+        for is_color, color, rank in options:
+            touched = [cv.order for cv in bhand
+                       if (cv.card.color == color if is_color else cv.card.rank == rank)]
+            if self._stall_match(in_zone, is_color, color if is_color else rank,
+                                 touched, r.rank_known, r.color_known):
+                continue
+            sig = self._stable_signal_orders(
+                borders, touched, r.clued, r.color_known, r.rank_known,
+                is_color, rank, ct, obs.max_clue_tokens, r.sig_play,
+                obs.play_stacks, obs.colors)
+            if not sig:
+                continue
+            score, ok = 0.0, True
+            for o, act in sig:
+                card = cardof[o]
+                if act == "play":
+                    if not obs.is_playable(card):
+                        ok = False
+                        break
+                    score += self._play_value(obs, r, o, card, deducible, idmap)
+                else:
+                    score += self._discard_value(obs, r, o, card, deducible_trash)
+            if not ok:
+                continue
+            action = (Action.clue_color(bob, color) if is_color
+                      else Action.clue_rank(bob, rank))
+            out.append((score, 1, action))
+        return out
+
+    def _reactive_candidates(self, obs, r, idmap, ct):
+        me, n = obs.player_index, obs.num_players
+        cathy = (me + 2) % n
+        bob = (me + 1) % n
+        E = self._expected_signal(obs, cathy, r)
+        if E is None:
+            return []
+        chand = obs.hands[cathy]
+        corders = [cv.order for cv in chand]
+        e_card = next((cv.card for cv in chand if cv.order == E[2]), None)
+        cathy_deducible = self._other_deducible_plays(obs, r, cathy)
+        if self.GOODTOUCH_DEDUCIBLE_DUP and self.ASSUME_TEAMMATES_DEDUCE \
+                and e_card is not None:
+            if e_card in {cv.card for cv in chand if cv.order in cathy_deducible}:
+                return []
+        cathy_deducible_trash = self._other_deducible_trash(obs, r, cathy)
+        if E[0] == "play":
+            exp_score = self._play_value(obs, r, E[2], e_card, cathy_deducible, idmap)
+        else:
+            exp_score = self._discard_value(obs, r, E[2], e_card, cathy_deducible_trash)
+
+        bhand = obs.hands[bob]
+        bslots, bby = self._hand_slots([cv.order for cv in bhand])
+        bcard = {cv.order: cv.card for cv in bhand}
+        bob_handsize = len(bhand)
+        bob_deducible = self._other_deducible_plays(obs, r, bob)
+        bob_deducible_trash = self._other_deducible_trash(obs, r, bob)
+        signalled_plays = [(cv.order, (cv.card.color, cv.card.rank))
+                           for hand in (bhand, chand) for cv in hand
+                           if cv.order in r.sig_play and cv.card is not None]
+        in_zone = self._in_endgame(obs.deck_size, sum(obs.play_stacks.values()),
+                                   obs.num_players, len(obs.colors) * 5)
+        options = [(True, c, None) for c in {cv.card.color for cv in chand}]
+        options += [(False, None, rk) for rk in {cv.card.rank for cv in chand}]
+        out = []
+        for is_color, color, rank in options:
+            touched = [cv.order for cv in chand
+                       if (cv.card.color == color if is_color else cv.card.rank == rank)]
+            if (not self.STALLS_STABLE_ONLY
+                    and self._stall_match(in_zone, is_color, color if is_color else rank,
+                                          touched, r.rank_known, r.color_known)):
+                continue
+            if (self.EIGHT_CLUE_STALL and self.EIGHT_CLUE_STALL_REACTIVE
+                    and (not is_color) and rank in self.EIGHT_CLUE_STALL_RANKS
+                    and obs.clue_tokens == obs.max_clue_tokens):
+                continue  # reads as a Cathy-directed 8-clue stall, not a reaction
+            I = self._compute_initial(corders, touched, r.clued, r.color_known,
+                                      r.rank_known, is_color)
+            if I is None:
+                continue
+            flip = (I[0] != E[0])
+            k = (I[1] - E[1]) % len(chand)
+            bslot = 1 + k
+            if bslot > bob_handsize:
+                continue
+            order = bby[bslot]
+            card = bcard[order]
+            if not flip and any(o != order and ident == (card.color, card.rank)
+                                for o, ident in signalled_plays):
+                continue
+            intermediate = E[3]
+            if intermediate is not None:
+                if flip or card != intermediate:
+                    continue
+            elif not flip:
+                if not obs.is_playable(card):
+                    continue
+                if e_card is not None and card == e_card:
+                    continue
+            else:
+                if obs.clue_tokens - 1 >= obs.max_clue_tokens:
+                    continue
+                if not self._is_trash(obs, order, card, r):
+                    continue
+            if not flip:
+                react_score = self._play_value(obs, r, order, card, bob_deducible, idmap)
+            else:
+                react_score = self._discard_value(obs, r, order, card, bob_deducible_trash)
+            action = (Action.clue_color(cathy, color) if is_color
+                      else Action.clue_rank(cathy, rank))
+            out.append((exp_score + react_score, 0, action))
+        return out
+
+    # --- flowchart ------------------------------------------------------
+    def act(self, obs: Observation) -> Action:
+        in_zone = self._in_endgame(obs.deck_size, sum(obs.play_stacks.values()),
+                                   obs.num_players, len(obs.colors) * 5)
+        if in_zone:
+            return self._endgame_act(obs)
+        return self._scored_act(obs)
+
+    def _scored_act(self, obs: Observation) -> Action:
+        r = self._derive(obs)
+        me, n = obs.player_index, obs.num_players
+        # 1. forced reaction
+        if r.pending is not None and n == 3:
+            giver, _t, _I = r.pending
+            if (giver + 1) % n == me:
+                react = self._react(obs, r, r.pending)
+                if react is not None:
+                    return react
+        # 2. play (deduced, then signalled)
+        for play in (self._extra_play(obs, r), self._play_signaled(obs, r)):
+            if play is not None:
+                return play
+        clues = self._clue_candidates(obs, r)
+        best = min(clues, key=self._clue_key) if clues else None
+        # 3. best clue scoring above the (clue-count-dependent) threshold
+        if best is not None and best[0] > self._step3_threshold(obs.clue_tokens):
+            return best[2]
+        # 4. discard a discard-signal / deduced trash
+        if obs.clue_tokens < obs.max_clue_tokens:
+            d = self._discard_signaled(obs, r) or self._trash_discard(obs)
+            if d is not None:
+                return d
+        # 5. best clue scoring positively
+        if best is not None and best[0] > 0:
+            return best[2]
+        # 6. discard the chop (leftmost untouched)
+        if obs.clue_tokens < obs.max_clue_tokens:
+            d6 = self._discard_chop(obs, r)
+            if d6 is not None:
+                return d6
+        # forced fallback
+        if obs.clue_tokens > 0:
+            st = self._stall_clue(obs)
+            if st is not None:
+                return st
+        return self._fallback(obs, r)
 
 
-class ReactorDeferDupPlayer(ReactorEndgamePlayer):
-    """Experiment: rdend + DEDUCE_DEFER_DUP_SIGNAL -- defer a deduced play when an
-    own play-signalled card might be its duplicate, playing the signalled (unknown)
-    card first so the deduced (known) card stays re-checkable afterwards."""
+class ReactorBridgePlayer(ReactorScoredPlayer):
+    """Intermediate between rdend and rdscore: rdend's exact flowchart, but a
+    reactive clue scoring <= 2 is deprioritised BELOW discarding a discard-signal
+    / trash card (rdend gives every reactive clue above discarding). The reactive
+    clue is still selected by rdend's `_reactive_clue`; only its score gates where
+    it sits relative to the discard. No other rdscore changes (no skip-signalled,
+    no stable/reactive score pooling)."""
 
-    name = "rddefer"
-    DEDUCE_DEFER_DUP_SIGNAL = True
+    name = "rdbridge"
+    EXPECTED_SKIP_SIGNALLED = False  # use rdend's expected signal, not the skip
+    #: Reactive-clue selection: False = rdend's `_reactive_key` heuristic;
+    #: True = the highest-scoring legal reactive clue.
+    REACTIVE_MAX_SCORE = False
+    #: Gate placement: False = only the SELECTED reactive clue, if it scores above
+    #: the gate, goes above discarding; True = a reactive clue goes above discarding
+    #: whenever ANY legal reactive clue clears the gate (selecting the best).
+    REACTIVE_GATE_ANY = False
+
+    #: Reactive-clue gate: a reactive clue must score strictly above this to be
+    #: given above discarding. REACT_GATE_LOW (if set) overrides it at <=1 clue --
+    #: e.g. 4.0 means no reactive clue can clear it there, so discarding a
+    #: discard-signal/trash always wins when clues are scarce.
+    REACT_GATE = 2.0
+    REACT_GATE_LOW = None
+
+    #: If set, when the chosen reactive clue scores <= this, prefer a stable play
+    #: clue over it (a stable play clue otherwise sits below the low-value reactive).
+    STABLE_OVER_REACTIVE_MAX = None
+
+    def _react_gate(self, clue_tokens: int) -> float:
+        if self.REACT_GATE_LOW is not None and clue_tokens <= 1:
+            return self.REACT_GATE_LOW
+        return self.REACT_GATE
+
+    def act(self, obs: Observation) -> Action:
+        in_zone = self._in_endgame(obs.deck_size, sum(obs.play_stacks.values()),
+                                   obs.num_players, len(obs.colors) * 5)
+        if in_zone:
+            return self._endgame_act(obs)
+        return self._bridge_act(obs)
+
+    def _select(self, options):
+        """Pick one (key, score, action) from reactive options."""
+        if self.REACTIVE_MAX_SCORE:
+            return min(options, key=lambda o: (-o[1], o[0]))
+        return min(options, key=lambda o: o[0])
+
+    def _reactive_options(self, obs, r):
+        """Every valid reactive clue as (reactive_key, score, action). Mirrors
+        rdend's `_reactive_clue` enumeration (so `_reactive_key` selection matches
+        it exactly) while also attaching the rdscore additive score."""
+        me, n = obs.player_index, obs.num_players
+        if obs.clue_tokens <= 0 or n != 3:
+            return []
+        cathy, bob = (me + 2) % n, (me + 1) % n
+        E = self._expected_signal(obs, cathy, r)
+        if E is None:
+            return []
+        chand = obs.hands[cathy]
+        corders = [cv.order for cv in chand]
+        e_card = next((cv.card for cv in chand if cv.order == E[2]), None)
+        idmap = {cv.order: (cv.card.color, cv.card.rank)
+                 for p in range(n) if p != me
+                 for cv in obs.hands[p] if cv.card is not None}
+        cathy_ded = self._other_deducible_plays(obs, r, cathy)
+        if E[0] == "play":
+            exp = self._play_value(obs, r, E[2], e_card, cathy_ded, idmap)
+        else:
+            exp = self._discard_value(obs, r, E[2], e_card,
+                                      self._other_deducible_trash(obs, r, cathy))
+        bhand = obs.hands[bob]
+        bslots, bby = self._hand_slots([cv.order for cv in bhand])
+        bcard = {cv.order: cv.card for cv in bhand}
+        bob_handsize = len(bhand)
+        leftmost_nopsig = min((bslots[cv.order] for cv in bhand
+                               if cv.order not in r.sig_play), default=99)
+        signalled_plays = [(cv.order, (cv.card.color, cv.card.rank))
+                           for hand in (bhand, chand) for cv in hand
+                           if cv.order in r.sig_play and cv.card is not None]
+        bob_ded = (self._other_deducible_plays(obs, r, bob)
+                   if self.ASSUME_TEAMMATES_DEDUCE else set())
+        bob_ded_trash = self._other_deducible_trash(obs, r, bob)
+        in_zone = self._in_endgame(obs.deck_size, sum(obs.play_stacks.values()),
+                                   obs.num_players, len(obs.colors) * 5)
+        opts = [(True, c, None) for c in {cv.card.color for cv in chand}]
+        opts += [(False, None, rk) for rk in {cv.card.rank for cv in chand}]
+        out = []
+        for is_color, color, rank in opts:
+            touched = [cv.order for cv in chand
+                       if (cv.card.color == color if is_color else cv.card.rank == rank)]
+            if (not self.STALLS_STABLE_ONLY
+                    and self._stall_match(in_zone, is_color, color if is_color else rank,
+                                          touched, r.rank_known, r.color_known)):
+                continue
+            if (self.EIGHT_CLUE_STALL and self.EIGHT_CLUE_STALL_REACTIVE
+                    and (not is_color) and rank in self.EIGHT_CLUE_STALL_RANKS
+                    and obs.clue_tokens == obs.max_clue_tokens):
+                continue  # reads as a Cathy-directed 8-clue stall, not a reaction
+            I = self._compute_initial(corders, touched, r.clued, r.color_known,
+                                      r.rank_known, is_color)
+            if I is None:
+                continue
+            flip = (I[0] != E[0])
+            k = (I[1] - E[1]) % len(chand)
+            bslot = 1 + k
+            if bslot > bob_handsize:
+                continue
+            order = bby[bslot]
+            card = bcard[order]
+            if not flip and any(o != order and ident == (card.color, card.rank)
+                                for o, ident in signalled_plays):
+                continue
+            intermediate = E[3]
+            if intermediate is not None:
+                if flip or card != intermediate:
+                    continue
+            elif not flip:
+                if not obs.is_playable(card):
+                    continue
+                if e_card is not None and card == e_card:
+                    continue
+            else:
+                if obs.clue_tokens - 1 >= obs.max_clue_tokens:
+                    continue
+                if not self._is_trash(obs, order, card, r):
+                    continue
+            if not flip:
+                rscore = self._play_value(obs, r, order, card, bob_ded, idmap)
+            else:
+                rscore = self._discard_value(obs, r, order, card, bob_ded_trash)
+            dprio = self._discard_priority(obs, card) if flip else 0
+            redundant = (not flip) and (order in bob_ded)
+            key = self._reaction_key(obs, r, flip, bslot, k, leftmost_nopsig,
+                                     dprio, redundant, order, card, idmap,
+                                     bob_ded, cathy_ded)
+            act = (Action.clue_color(cathy, color) if is_color
+                   else Action.clue_rank(cathy, rank))
+            out.append((key, exp + rscore, act))
+        return out
+
+    def _reaction_key(self, obs, r, flip, bslot, k, leftmost_nopsig, dprio,
+                      redundant, order, card, idmap, bob_ded, cathy_ded):
+        """Sort key for a reaction (lower = preferred). Default = rdend's
+        `_reactive_key`; subclasses may insert extra criteria."""
+        return self._reactive_key(obs, flip, bslot, k, leftmost_nopsig, dprio,
+                                  redundant)
+
+    def _bridge_act(self, obs: Observation) -> Action:
+        r = self._derive(obs)
+        me, n = obs.player_index, obs.num_players
+        # 1. forced reaction
+        if r.pending is not None and n == 3:
+            giver, _t, _I = r.pending
+            if (giver + 1) % n == me:
+                react = self._react(obs, r, r.pending)
+                if react is not None:
+                    return react
+        # 2. play (deduced, then signalled)
+        for play in (self._extra_play(obs, r), self._play_signaled(obs, r)):
+            if play is not None:
+                return play
+        # 3. reactive clue above discarding, gated by score > threshold.
+        gate = self._react_gate(obs.clue_tokens)
+        options = self._reactive_options(obs, r)
+        chosen = self._select(options) if options else None
+        if self.REACTIVE_GATE_ANY:
+            above = [o for o in options if o[1] > gate]
+            gate_pick = self._select(above) if above else None
+        else:
+            gate_pick = chosen if (chosen is not None and chosen[1] > gate) else None
+        if gate_pick is not None:
+            return gate_pick[2]
+        # discard a discard-signal / trash card, above a low-value reactive clue
+        if obs.clue_tokens < obs.max_clue_tokens:
+            d = self._discard_signaled(obs, r) or self._trash_discard(obs)
+            if d is not None:
+                return d
+        # if the reactive clue is weak (<= STABLE_OVER_REACTIVE_MAX), prefer a
+        # stable play clue over it.
+        if (self.STABLE_OVER_REACTIVE_MAX is not None and chosen is not None
+                and chosen[1] <= self.STABLE_OVER_REACTIVE_MAX and obs.clue_tokens > 0):
+            sp = self._stable_clue(obs, r, want_play=True)
+            if sp is not None:
+                return sp
+        # the low-value reactive clue now sits here
+        if chosen is not None:
+            return chosen[2]
+        # rest of rdend's flowchart unchanged
+        if obs.clue_tokens > 0:
+            sp = self._stable_clue(obs, r, want_play=True)
+            if sp is not None:
+                return sp
+        if obs.clue_tokens > 0:
+            sd = self._stable_clue(obs, r, want_play=False)
+            if sd is not None:
+                return sd
+        if obs.clue_tokens < obs.max_clue_tokens:
+            ch = self._discard_chop(obs, r)
+            if ch is not None:
+                return ch
+        if obs.clue_tokens > 0:
+            st = self._stall_clue(obs)
+            if st is not None:
+                return st
+        return self._fallback(obs, r)
+
+
+class ReactorBridge4Player(ReactorBridgePlayer):
+    """rdbridge, but the play-reaction tiebreak chain is:
+      1.  non-redundant (Bob can't already deduce it playable)
+      2.  prefer a card with no play signal
+      2.1 prefer a card with no other copy already queued-to-play / deducibly playable
+      2.2 prefer a card not yet touched (clued)
+      2.3 prefer a card with no other copy already touched
+      3.  leftmost (lower slot), then k
+    (criterion 2 is now the broad 'no play signal', so 2.1-2.3 actually break ties
+    before the leftmost-slot preference.)"""
+
+    name = "rdbridge4"
+
+    def _reaction_key(self, obs, r, flip, bslot, k, leftmost_nopsig, dprio,
+                      redundant, order, card, idmap, bob_ded, cathy_ded):
+        base = self._reactive_key(obs, flip, bslot, k, leftmost_nopsig, dprio,
+                                  redundant)
+        if flip:
+            return base  # discard reaction: unchanged
+        pid = (card.color, card.rank)
+        accounted = r.sig_play | bob_ded | cathy_ded
+        dup_queued = any(o2 != order and idmap.get(o2) == pid for o2 in accounted)
+        touched = order in r.clued
+        dup_touched = any(o2 != order and idmap.get(o2) == pid for o2 in r.clued)
+        wrapper, play_key = base
+        red, _slot_match, bslot_, k_ = play_key
+        new_play_key = (red,
+                        1 if order in r.sig_play else 0,  # 2. prefer no play signal
+                        1 if dup_queued else 0,            # 2.1
+                        1 if touched else 0,               # 2.2
+                        1 if dup_touched else 0,           # 2.3
+                        bslot_, k_)                        # 3. leftmost, then k
+        return (wrapper, new_play_key)
+
+
+class ReactorPtrNoSkipPlayer(ReactorBridge4Player):
+    """rdbridge4 but the rank-clue discard pointer skips only PREVIOUSLY-clued
+    cards, not cards clued by the same clue (so a just-clued card can be the
+    discard target)."""
+
+    name = "rdptrnoskip"
+    DISCARD_PTR_SKIP_NEW = False

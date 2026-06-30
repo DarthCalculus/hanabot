@@ -17,10 +17,11 @@ from .player_first_player import PlayerFirstPlayer
 from .random_player import RandomPlayer
 from .reactor_deduce_player import (
     ReactorDeducePlayer,
-    ReactorDeducePlayPriorityPlayer,
-    ReactorDeferDupPlayer,
     ReactorEndgamePlayer,
-    ReactorGoodTouchPlayer,
+    ReactorScoredPlayer,
+    ReactorBridgePlayer,
+    ReactorBridge4Player,
+    ReactorPtrNoSkipPlayer,
 )
 from .reactor_player import ReactorPlayer
 from .tempo_player import TempoPlayer
@@ -44,8 +45,9 @@ __all__ = [
     "DistantSavePlayer",
     "ReactorPlayer",
     "ReactorDeducePlayer",
-    "ReactorDeducePlayPriorityPlayer",
     "ReactorEndgamePlayer",
-    "ReactorGoodTouchPlayer",
-    "ReactorDeferDupPlayer",
+    "ReactorScoredPlayer",
+    "ReactorBridgePlayer",
+    "ReactorBridge4Player",
+    "ReactorPtrNoSkipPlayer",
 ]

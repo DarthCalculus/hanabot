@@ -110,6 +110,42 @@ class ReactorPlayer(Player):
     #: more tempo than the rare strike costs. Giver-side only / sound; left off.
     GOODTOUCH_DEDUCIBLE_DUP = False
 
+    #: Experiment: the expected signal (and 1-away) never targets a card that
+    #: already carries a signal (play OR discard) -- re-signalling it conveys
+    #: nothing new. Common-knowledge safe (signals are derived from the public
+    #: log, so giver and reactor agree).
+    EXPECTED_SKIP_SIGNALLED = False
+
+    #: In `_reactive_key`, prefer a play-reaction over a discard-reaction when
+    #: clue_tokens >= this (below it, prefer the discard to regain a clue). 2 =>
+    #: discards preferred only at <=1 clue; 3 => discards preferred at <=2.
+    PLAY_PREF_MIN_CLUES = 2
+
+    #: Convention: a clue of a rank in EIGHT_CLUE_STALL_RANKS given at MAX clue
+    #: tokens carries no signal (a forced stall -- you can't discard at max clues).
+    #: Disable (or narrow the ranks) to make such clues carry their normal signal.
+    #: STABLE => such a clue to the NEXT player (Bob) is the stall; REACTIVE => such
+    #: a clue to the FAR player (Cathy) is the stall (and Bob clues carry signals).
+    EIGHT_CLUE_STALL = True
+    EIGHT_CLUE_STALL_RANKS = (3, 4, 5)
+    EIGHT_CLUE_STALL_STABLE = True
+    EIGHT_CLUE_STALL_REACTIVE = False
+
+    #: Convention: a STABLE rank-1 clue means "play all the 1s it touches" (or
+    #: discard them all if they can't all be played). Disable to treat rank-1 like
+    #: any other rank clue (a discard pointer).
+    ONES_PLAY_ALL = True
+
+    #: Experiment: only STABLE clues (to the next player) may be stalls; a stall-
+    #: rank clue to the FAR player is always read as a reactive clue (never a
+    #: stall). Keeps 3/4/5-to-Cathy reactive.
+    STALLS_STABLE_ONLY = False
+
+    #: Rank-clue discard pointer: True (default) skips every clued card incl. those
+    #: clued by THIS clue; False skips only previously-clued cards, so a card this
+    #: clue touches can itself be the discard target.
+    DISCARD_PTR_SKIP_NEW = True
+
     # ==================================================================
     #  Turn entry point
     # ==================================================================
@@ -252,8 +288,12 @@ class ReactorPlayer(Player):
             return ("play", min(slots[o] for o in new))
 
         # Rank clue: each new card points to the first untouched card on its
-        # left; discard the leftmost pointed-to card.
-        touched_now = set(clued_before) | set(touched)
+        # left; discard the leftmost pointed-to card. By default a card is "touched"
+        # (skipped) if clued by ANY clue incl. this one; with DISCARD_PTR_SKIP_NEW
+        # off, only PREVIOUSLY-clued cards are skipped (a card clued by this clue
+        # can be the pointer target).
+        touched_now = (set(clued_before) | set(touched)
+                       if self.DISCARD_PTR_SKIP_NEW else set(clued_before))
         ptrs = [self._point_left(slots[o], by_slot, handsize, touched_now) for o in new]
         return ("discard", min(ptrs))
 
@@ -265,14 +305,16 @@ class ReactorPlayer(Player):
 
         # Rank-1: play-signal all the 1s, or discard-signal them all if they
         # can't all be played (stacks + 1s already carrying a play signal).
-        if (not is_color) and rank == 1:
+        if self.ONES_PLAY_ALL and (not is_color) and rank == 1:
             needed = sum(1 for c in colors if stacks[c] == 0)
             already = sum(1 for o in sig_play if rank_known.get(o) == 1)
             play_all = len(new) <= (needed - already)
             return [(o, "play" if play_all else "discard") for o in new]
 
-        # 8-clue stall: a 3/4/5 given at max tokens carries no signal.
-        if (not is_color) and rank in (3, 4, 5) and clue_tokens == max_tok:
+        # 8-clue stall (stable side): a stall-rank clue to the next player at max
+        # tokens carries no signal.
+        if (self.EIGHT_CLUE_STALL and self.EIGHT_CLUE_STALL_STABLE and (not is_color)
+                and rank in self.EIGHT_CLUE_STALL_RANKS and clue_tokens == max_tok):
             return []
 
         I = self._compute_initial(orders, touched, clued_before, color_known,
@@ -346,10 +388,20 @@ class ReactorPlayer(Player):
 
                 in_zone = self._in_endgame(deck, sum(stacks.values()), n, max_score)
                 stall_value = a.color if is_color else a.rank
-                if self._stall_match(in_zone, is_color, stall_value, touched,
-                                     rank_known, color_known):
+                is_reactive = (n == 3 and target == (giver + 2) % n)
+                stall = self._stall_match(in_zone, is_color, stall_value, touched,
+                                          rank_known, color_known)
+                if self.STALLS_STABLE_ONLY and is_reactive:
+                    stall = False  # a clue to the far player is always reactive
+                # 8-clue stall directed at the far player (Cathy).
+                if (self.EIGHT_CLUE_STALL and self.EIGHT_CLUE_STALL_REACTIVE
+                        and is_reactive and (not is_color)
+                        and a.rank in self.EIGHT_CLUE_STALL_RANKS
+                        and clue_tokens == max_tok):
+                    stall = True
+                if stall:
                     pass  # endgame stall: no signal, no reaction
-                elif n == 3 and target == (giver + 2) % n:
+                elif is_reactive:
                     I = self._compute_initial(torders, touched, clued_before,
                                               color_known, rank_known, is_color)
                     self._apply_reactive(log, i, hands, n, torders, I,
@@ -448,11 +500,14 @@ class ReactorPlayer(Player):
         psig_ids = {(cv.card.color, cv.card.rank) for cv in hand
                     if cv.order in r.sig_play and cv.card is not None}
 
+        def signalled(o):
+            return o in r.sig_play or (self.EXPECTED_SKIP_SIGNALLED and o in r.sig_disc)
+
         best = None
         for cv in hand:
             if cv.card is None or not obs.is_playable(cv.card):
                 continue
-            if cv.order in r.sig_play:
+            if signalled(cv.order):
                 continue
             if (cv.card.color, cv.card.rank) in psig_ids:
                 continue
@@ -466,6 +521,9 @@ class ReactorPlayer(Player):
         for cv in hand:
             if cv.card is None:
                 continue
+            if self.EXPECTED_SKIP_SIGNALLED and (cv.order in r.sig_play
+                                                 or cv.order in r.sig_disc):
+                continue  # already signalled -- re-signalling conveys nothing
             dead = obs.is_dead(cv.card)
             dup_in_hand = any(o.order != cv.order and o.card == cv.card for o in hand)
             if not (dead or dup_in_hand):
@@ -487,7 +545,7 @@ class ReactorPlayer(Player):
                     continue
                 if cv.card.rank != obs.play_stacks[cv.card.color] + 2:
                     continue  # not exactly one away from playable
-                if cv.order in r.sig_play:
+                if signalled(cv.order):
                     continue
                 if (cv.card.color, cv.card.rank) in psig_ids:
                     continue
@@ -635,9 +693,16 @@ class ReactorPlayer(Player):
         for is_color, color, rank in options:
             touched = [cv.order for cv in chand
                        if (cv.card.color == color if is_color else cv.card.rank == rank)]
-            # A clue that reads as an endgame stall can't carry a signal.
-            if self._stall_match(in_zone, is_color, color if is_color else rank,
-                                 touched, r.rank_known, r.color_known):
+            # A clue that reads as an endgame stall can't carry a signal (unless
+            # stalls are stable-only, in which case a far-player clue is reactive).
+            if (not self.STALLS_STABLE_ONLY
+                    and self._stall_match(in_zone, is_color, color if is_color else rank,
+                                          touched, r.rank_known, r.color_known)):
+                continue
+            # ...nor one that reads as an 8-clue stall directed at the far player.
+            if (self.EIGHT_CLUE_STALL and self.EIGHT_CLUE_STALL_REACTIVE
+                    and (not is_color) and rank in self.EIGHT_CLUE_STALL_RANKS
+                    and obs.clue_tokens == obs.max_clue_tokens):
                 continue
             I = self._compute_initial(corders, touched, r.clued,
                                       r.color_known, r.rank_known, is_color)
@@ -698,19 +763,20 @@ class ReactorPlayer(Player):
         candidates.sort(key=lambda t: t[0])
         return candidates[0][1]
 
-    @staticmethod
-    def _reactive_key(obs, flip, bslot, k, leftmost_nopsig, dprio, redundant=False) -> tuple:
-        """Lower sorts first. Plays are preferred at >=2 clues, discards at <2;
-        among plays, a non-redundant card (Bob can't self-deduce it) beats a
-        redundant one, then the leftmost no-play-signal slot; among discards,
-        actual trash (dprio 0) beats a duplicate (1), then the leftmost slot."""
+    def _reactive_key(self, obs, flip, bslot, k, leftmost_nopsig, dprio, redundant=False) -> tuple:
+        """Lower sorts first. Plays are preferred at >= PLAY_PREF_MIN_CLUES clues,
+        discards below that; among plays, a non-redundant card (Bob can't
+        self-deduce it) beats a redundant one, then the leftmost no-play-signal
+        slot; among discards, actual trash (dprio 0) beats a duplicate (1), then
+        the leftmost slot."""
+        prefer_play = obs.clue_tokens >= self.PLAY_PREF_MIN_CLUES
         is_play = not flip
         if is_play:
             play_key = (1 if redundant else 0,
                         0 if bslot == leftmost_nopsig else 1, bslot, k)
-            return (0, play_key) if obs.clue_tokens >= 2 else (1, play_key)
+            return (0, play_key) if prefer_play else (1, play_key)
         disc_key = (dprio, bslot, k)
-        return (1, disc_key) if obs.clue_tokens >= 2 else (0, disc_key)
+        return (1, disc_key) if prefer_play else (0, disc_key)
 
     # ==================================================================
     #  Giving a stable clue (we are Alice, target = Bob)
@@ -862,6 +928,23 @@ class ReactorPlayer(Player):
                 out.add(cv.order)
         return out
 
+    def _other_deducible_trash(self, obs: Observation, r: _Derived, other: int) -> set:
+        """Orders in ``other``'s hand that ``other`` can PROVE are trash from
+        common knowledge alone (every remaining possibility is dead). Conservative
+        like _other_deducible_plays -- an unclued card is never deducible trash."""
+        me = obs.player_index
+        counts = self._copies_excluding(obs, (other, me))
+        out: set = set()
+        for cv in obs.hands[other]:
+            remaining = [
+                (c, rank)
+                for c in cv.possible_colors for rank in cv.possible_ranks
+                if counts.get((c, rank), 0) < RANK_COUNTS[rank]
+            ]
+            if remaining and all(rank <= obs.play_stacks[c] for c, rank in remaining):
+                out.add(cv.order)
+        return out
+
     @staticmethod
     def _remaining_identities(obs: Observation, i: int, elsewhere: dict) -> list:
         """Identities own-hand card ``i`` could still be: its clue possibilities
@@ -982,11 +1065,18 @@ class ReactorPlayer(Player):
     # ==================================================================
     def _stall_clue(self, obs: Observation) -> Action | None:
         me = obs.player_index
-        bob = (me + 1) % obs.num_players
-        bhand = obs.hands[bob]
+        n = obs.num_players
+        # With a reactive 8-clue stall, the stall must go to the far player (Cathy)
+        # at max tokens; otherwise to the next player (Bob).
+        if (self.EIGHT_CLUE_STALL and self.EIGHT_CLUE_STALL_REACTIVE and n == 3
+                and obs.clue_tokens == obs.max_clue_tokens):
+            tgt = (me + 2) % n
+        else:
+            tgt = (me + 1) % n
+        thand = obs.hands[tgt]
         for rank in (5, 4, 3):
-            if any(cv.card.rank == rank for cv in bhand):
-                return Action.clue_rank(bob, rank)
+            if rank in self.EIGHT_CLUE_STALL_RANKS and any(cv.card.rank == rank for cv in thand):
+                return Action.clue_rank(tgt, rank)
         return self._any_clue(obs)
 
     def _fallback(self, obs: Observation, r: _Derived) -> Action:

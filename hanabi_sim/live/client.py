@@ -68,7 +68,10 @@ class HanabiLiveClient:
         )
 
     def run(self):
-        self.ws.run_forever()
+        # Send a WebSocket ping every 10s. hanab.live drops a client that goes
+        # silent (~15s), so an idle lobby bot would otherwise be disconnected
+        # before anyone can invite it; the keepalive keeps the connection open.
+        self.ws.run_forever(ping_interval=10, ping_timeout=8)
 
     # --- transport --------------------------------------------------------
     @staticmethod

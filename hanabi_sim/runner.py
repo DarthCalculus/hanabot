@@ -25,10 +25,11 @@ from .players.player_first_player import PlayerFirstPlayer
 from .players.random_player import RandomPlayer
 from .players.reactor_deduce_player import (
     ReactorDeducePlayer,
-    ReactorDeducePlayPriorityPlayer,
-    ReactorDeferDupPlayer,
     ReactorEndgamePlayer,
-    ReactorGoodTouchPlayer,
+    ReactorScoredPlayer,
+    ReactorBridgePlayer,
+    ReactorBridge4Player,
+    ReactorPtrNoSkipPlayer,
 )
 from .players.reactor_player import ReactorPlayer
 from .players.tempo_player import TempoPlayer
@@ -70,10 +71,11 @@ STRATEGIES: dict[str, PlayerFactory] = {
     "distsave": lambda ctx: DistantSavePlayer(),
     "reactor": lambda ctx: ReactorPlayer(),
     "rdeduce": lambda ctx: ReactorDeducePlayer(),
-    "rdplay": lambda ctx: ReactorDeducePlayPriorityPlayer(),
     "rdend": lambda ctx: ReactorEndgamePlayer(),
-    "rdgt": lambda ctx: ReactorGoodTouchPlayer(),
-    "rddefer": lambda ctx: ReactorDeferDupPlayer(),
+    "rdscore": lambda ctx: ReactorScoredPlayer(),
+    "rdbridge": lambda ctx: ReactorBridgePlayer(),
+    "rdbridge4": lambda ctx: ReactorBridge4Player(),
+    "rdptrnoskip": lambda ctx: ReactorPtrNoSkipPlayer(),
 }
 
 # Guard against a strategy that never makes progress.
