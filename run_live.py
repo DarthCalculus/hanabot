@@ -27,6 +27,7 @@ from hanabi_sim.players import (
     GreedyPlayer,
     ReactorBridge4Player,
     ReactorCritPlayChopPlayer,
+    ReactorReactDiscDedupPlayer,
     ReactorDeducePlayer,
     ReactorEndgamePlayer,
     ReactorPlayer,
@@ -34,7 +35,9 @@ from hanabi_sim.players import (
 )
 
 STRATEGIES = {
-    "rdcritplay": ReactorCritPlayChopPlayer,  # current best: chop critical/playable save
+    "rdrdd": ReactorReactDiscDedupPlayer,  # current best (~83%): initial-dependent E,
+                                           # victim-view cond2, reaction discard dedup
+    "rdcritplay": ReactorCritPlayChopPlayer,  # chop critical/playable save
     "rdptrnoskip": ReactorPtrNoSkipPlayer,  # prior best + human-friendly pointer
     "rdbridge4": ReactorBridge4Player,
     "rdend": ReactorEndgamePlayer,
@@ -57,7 +60,7 @@ def main() -> int:
             pass
 
     parser = argparse.ArgumentParser(description="Play on hanab.live with a hanabi_sim strategy")
-    parser.add_argument("--strategy", choices=sorted(STRATEGIES), default="rdcritplay")
+    parser.add_argument("--strategy", choices=sorted(STRATEGIES), default="rdrdd")
     parser.add_argument("--username", default=os.environ.get("HANABI_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("HANABI_PASSWORD"))
     parser.add_argument(

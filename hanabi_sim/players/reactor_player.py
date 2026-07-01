@@ -29,7 +29,7 @@ one-line flip if that turns out to be a typo for "chop" (oldest).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 
 from ..actions import Action, ActionType
 from ..cards import RANK_COUNTS, Card
@@ -47,6 +47,9 @@ class _Derived:
     clued: set[int] = field(default_factory=set)
     color_known: dict = field(default_factory=dict)   # order -> Color
     rank_known: dict = field(default_factory=dict)    # order -> rank
+    # Orders "locked" (a repurposed discard-chop clue): protected from being
+    # chopped until they receive another signal. See LOCK_CHOP.
+    locked: set[int] = field(default_factory=set)
     # A trailing reactive clue with no reaction yet (giver, target, initial).
     pending: tuple | None = None
 
@@ -151,6 +154,23 @@ class ReactorPlayer(Player):
     #: measure (and later repurpose) the value of that clue space for 5-saves.
     BAN_STABLE_5_ON_CHOP = False
 
+    #: When True, never give a stable discard clue whose discard signal points at the
+    #: target's CHOP -- it's redundant (they'd discard chop anyway). Also stops Alice
+    #: assuming a teammate would give such a clue over chopping (cond2 routes through
+    #: _stable_clue). Frees "discard chop" to later imply a save. REJECTED (variant
+    #: "rdncd"): A/B -1.16pp -- the discard-chop clue is NOT redundant (it still
+    #: touches/protects the other rank cards), so banning it hurts. Kept for reference.
+    BAN_DISCARD_CHOP_CLUE = False
+
+    #: Repurpose the (redundant) "discard chop" stable clue as a LOCK: a locked hand
+    #: may not discard chop at all until it receives another signal. Alice gives it in
+    #: cat-4 (critical chop in danger, no normal save clue) as a last-resort save.
+    #: Implies the discard-chop ban. See _lock_clue. REJECTED (variant "rdlock"):
+    #: A/B -1.37pp (full lock) / -0.70pp (per-card protect); the lock does protect
+    #: criticals but the repurposing cost (-1.16pp) + stall/token drag outweigh it.
+    #: Kept (gated off) in case a cheaper trigger/behavior turns up. See _Derived.locked.
+    LOCK_CHOP = False
+
     #: When True, a stable rank-5 clue that touches the target's chop is a "5-save":
     #: it carries NO discard signal, just marks the chop as a 5 (so it stops being
     #: chop). Alice gives it as a last resort when Bob's chop-5 would otherwise be
@@ -191,6 +211,34 @@ class ReactorPlayer(Player):
     #: for the OPPOSITE signal (play-signalled twin => discard; discard-signalled
     #: twin => play) and ineligible for the same. See _expected_signal.
     EXPECTED_DEDUP_SIGNAL = True
+
+    #: Reaction good-touch (discard side): a reactive DISCARD reaction must not dump
+    #: a card whose identity is ALREADY discard-signalled on another copy (unless
+    #: dead) -- else both copies get discarded and the card is lost. Mirrors the
+    #: existing play-reaction guard (signalled_plays). See _reactive_clue / _reactive_options.
+    REACTION_DISCARD_DEDUP = False
+
+    #: cond2 (the chop-save's "victim will clue instead" skip) should predict the
+    #: victim's clue using only knowledge the victim has: Cathy's hand + the victim's
+    #: OWN known cards, not the victim's hidden cards that only the saver can see.
+    #: Fixes the disc-branch trash test counting dups in the victim's hidden hand.
+    COND2_VICTIM_VIEW = False
+
+    #: Make the expected signal DEPEND on the initial signal: with a play initial,
+    #: rank finesse above discard (a trash no longer blocks a finesse); with a
+    #: discard initial, play -> discard (-> cmd-discard). Lets Alice choose finesse
+    #: vs discard by clue type when both are available. See _expected_signal.
+    EXPECTED_SIGNAL_BY_INITIAL = False
+
+    #: Safe-discard command (uses the dead "no-normal-E + discard-initial" reactive
+    #: space): when Cathy has NO normal expected signal and her chop is CRITICAL,
+    #: Alice commands her to discard a card whose duplicate Alice sees in Bob's hand
+    #: (safe) instead of blind-chopping the critical -- via a reactive clue whose
+    #: initial signal is (discard, target_slot), which Bob passes through by blind-
+    #: playing his slot 1 (k=0, no flip; requires his slot 1 to be playable, which
+    #: Alice verifies). The target is Alice-private, so the fixed k=0 reaction is
+    #: what keeps it consistent. See _safe_discard_command / _react.
+    SAFE_DISCARD_COMMAND = False
 
     # ==================================================================
     #  Turn entry point
@@ -426,6 +474,7 @@ class ReactorPlayer(Player):
         rank_known: dict = {}
         sig_play: set[int] = set()
         sig_disc: set[int] = set()
+        locked: set[int] = set()
         stacks = {c: 0 for c in obs.colors}
         clue_tokens = max_tok
         max_score = len(obs.colors) * 5
@@ -465,13 +514,32 @@ class ReactorPlayer(Player):
                                          sig_play, sig_disc)
                     if i + 1 >= len(log):
                         pending = (giver, target, I)
+                    else:
+                        locked -= set(torders)  # Cathy got a reaction signal -> unlock
                 else:
                     sig = self._stable_signal_orders(
                         torders, touched, clued_before, color_known, rank_known,
                         is_color, a.rank, clue_tokens, max_tok, sig_play,
                         stacks, obs.colors)
+                    # The target's chop BEFORE this clue. A hand already holding a
+                    # lock has no chop (it won't chop), so a further discard-signal
+                    # there is a real signal, not a lock.
+                    if any(x in locked for x in torders):
+                        _chop = None
+                    else:
+                        _unt = [x for x in torders if x not in clued_before
+                                and x not in sig_play and x not in sig_disc]
+                        _chop = (max(_unt) if self.DISCARD_NEWEST_FIRST
+                                 else min(_unt)) if _unt else None
+                    real_signal = False
                     for o, act in sig:
-                        self._set_signal(sig_play, sig_disc, o, act)
+                        if self.LOCK_CHOP and act == "discard" and o == _chop:
+                            locked.add(o)     # repurposed discard-chop = LOCK
+                        else:
+                            self._set_signal(sig_play, sig_disc, o, act)
+                            real_signal = True
+                    if real_signal:
+                        locked -= set(torders)  # a real signal unlocks the hand
 
                 for o in touched:
                     if is_color:
@@ -489,6 +557,7 @@ class ReactorPlayer(Player):
                     deck -= 1  # a card was drawn from the deck
                 sig_play.discard(order)
                 sig_disc.discard(order)
+                locked.discard(order)
                 if a.type is ActionType.PLAY:
                     if rec.success:
                         stacks[rec.played_card.color] = rec.played_card.rank
@@ -504,6 +573,7 @@ class ReactorPlayer(Player):
             clued=clued,
             color_known=color_known,
             rank_known=rank_known,
+            locked=locked & current,
             pending=pending,
         )
 
@@ -536,8 +606,11 @@ class ReactorPlayer(Player):
     # ==================================================================
     #  Expected signal / trash (need visible cards; never our own hand)
     # ==================================================================
-    def _expected_signal(self, obs: Observation, who: int, r: _Derived) -> tuple | None:
+    def _expected_signal(self, obs: Observation, who: int, r: _Derived,
+                         initial_action: str | None = None) -> tuple | None:
         """Cathy's expected signal: (action, slot, order, intermediate), or None.
+        ``initial_action`` ("play"/"discard") selects the tier order when
+        EXPECTED_SIGNAL_BY_INITIAL is on; None/off = the initial-independent default.
 
         ``intermediate`` is None except for the optional "1-away" case (see
         REACTIVE_ONE_AWAY): then it is the Card Bob must play to unblock Cathy's
@@ -569,50 +642,52 @@ class ReactorPlayer(Player):
 
         # PLAY tier: leftmost unsignalled playable whose identity isn't already
         # play-signalled elsewhere (that twin will play; this copy would be a discard).
-        best = None
-        for cv in hand:
-            if cv.card is None or not obs.is_playable(cv.card):
-                continue
-            if signalled(cv.order):
-                continue
-            if (cv.card.color, cv.card.rank) in psig_ids:
-                continue
-            s = slots[cv.order]
-            if best is None or s < best[1]:
-                best = ("play", s, cv.order, None)
-        if best is not None:
+        def play_tier():
+            best = None
+            for cv in hand:
+                if cv.card is None or not obs.is_playable(cv.card):
+                    continue
+                if signalled(cv.order):
+                    continue
+                if (cv.card.color, cv.card.rank) in psig_ids:
+                    continue
+                s = slots[cv.order]
+                if best is None or s < best[1]:
+                    best = ("play", s, cv.order, None)
             return best
 
         # DISCARD tier: leftmost unsignalled trash/duplicate whose identity isn't
         # already discard-signalled elsewhere (that twin will be discarded, so this
         # copy is a play, not a discard).
-        trash = None
-        for cv in hand:
-            if cv.card is None:
-                continue
-            if self.EXPECTED_DEDUP_SIGNAL:
-                if signalled(cv.order):
+        def discard_tier():
+            trash = None
+            for cv in hand:
+                if cv.card is None:
                     continue
-                if (cv.card.color, cv.card.rank) in dsig_ids:
+                if self.EXPECTED_DEDUP_SIGNAL:
+                    if signalled(cv.order):
+                        continue
+                    if (cv.card.color, cv.card.rank) in dsig_ids:
+                        continue
+                elif self.EXPECTED_SKIP_SIGNALLED and (cv.order in r.sig_play
+                                                       or cv.order in r.sig_disc):
+                    continue  # already signalled -- re-signalling conveys nothing
+                dead = obs.is_dead(cv.card)
+                dup_in_hand = any(o.order != cv.order and o.card == cv.card for o in hand)
+                if not (dead or dup_in_hand):
                     continue
-            elif self.EXPECTED_SKIP_SIGNALLED and (cv.order in r.sig_play
-                                                   or cv.order in r.sig_disc):
-                continue  # already signalled -- re-signalling conveys nothing
-            dead = obs.is_dead(cv.card)
-            dup_in_hand = any(o.order != cv.order and o.card == cv.card for o in hand)
-            if not (dead or dup_in_hand):
-                continue
-            s = slots[cv.order]
-            if trash is None or s < trash[1]:
-                trash = ("discard", s, cv.order, None)
-        if trash is not None:
+                s = slots[cv.order]
+                if trash is None or s < trash[1]:
+                    trash = ("discard", s, cv.order, None)
             return trash
 
-        # Last resort (opt-in): the leftmost card that is one play away from being
-        # playable. Cathy will play it on her turn -- which only works if Bob's
-        # reaction is to play the unblocking card first (enforced by the giver in
-        # _reactive_clue). ``intermediate`` is that unblocking card.
-        if self.REACTIVE_ONE_AWAY:
+        # FINESSE tier (opt-in): leftmost card one play away from playable. Cathy
+        # plays it only if Bob's reaction PLAYS the unblocking card first, so it
+        # requires a PLAY initial signal -- hence it lives only in the play-initial
+        # ordering. ``intermediate`` is that unblocking card.
+        def finesse_tier():
+            if not self.REACTIVE_ONE_AWAY:
+                return None
             near = None
             for cv in hand:
                 if cv.card is None:
@@ -627,8 +702,22 @@ class ReactorPlayer(Player):
                 inter = Card(cv.card.color, cv.card.rank - 1)
                 if near is None or s < near[1]:
                     near = ("play", s, cv.order, inter)
-            if near is not None:
-                return near
+            return near
+
+        # The expected signal can DEPEND on the initial signal (EXPECTED_SIGNAL_BY_
+        # INITIAL): a finesse needs a play initial, so with a play initial we rank
+        # finesse ABOVE discard (so a trash no longer blocks a finesse), while a
+        # discard initial goes play -> discard (-> cmd-discard, handled elsewhere).
+        if self.EXPECTED_SIGNAL_BY_INITIAL and initial_action == "discard":
+            tiers = (play_tier, discard_tier)
+        elif self.EXPECTED_SIGNAL_BY_INITIAL and initial_action == "play":
+            tiers = (play_tier, finesse_tier, discard_tier)
+        else:  # initial-independent default: play -> discard -> finesse
+            tiers = (play_tier, discard_tier, finesse_tier)
+        for tier in tiers:
+            res = tier()
+            if res is not None:
+                return res
         return None
 
     @staticmethod
@@ -687,7 +776,17 @@ class ReactorPlayer(Player):
         _giver, target, I = pending
         if I is None:
             return None
-        E = self._expected_signal(obs, target, r)
+        E = self._expected_signal(obs, target, r, I[0])
+        # Safe-discard command: Cathy has NO normal play/discard (E is None, or E is
+        # a 1-away finesse with E[3] set) and Alice sent a DISCARD initial -> pass it
+        # through by blind-playing our slot 1 (k=0, no flip; Alice guarantees it's
+        # playable). The finesse uses the PLAY initial and is the default in this
+        # region; the discard-initial is otherwise unused.
+        if (self.SAFE_DISCARD_COMMAND and I[0] == "discard"
+                and (E is None or E[3] is not None)):
+            idx = self._engine_index_at_slot(obs, obs.player_index, 1)
+            if idx is not None:
+                return Action.play(idx)
         if E is None:
             return None
         flip = (I[0] != E[0])
@@ -704,6 +803,73 @@ class ReactorPlayer(Player):
     # ==================================================================
     #  Giving a reactive clue (we are Alice)
     # ==================================================================
+    def _safe_discard_command(self, obs: Observation, r: _Derived) -> Action | None:
+        """Reactive DISCARD command for when Cathy has NO normal expected signal but
+        her chop is critical: redirect her to discard a card whose duplicate Alice
+        sees in Bob's hand (safe) instead of blind-chopping the critical. Encoded as
+        a clue whose initial signal is (discard, target_slot); Bob passes it through
+        by blind-playing slot 1 (see _react), which requires his slot 1 to be
+        playable. Returns the clue Action, or None if unavailable."""
+        if not self.SAFE_DISCARD_COMMAND or obs.clue_tokens <= 0:
+            return None
+        me, n = obs.player_index, obs.num_players
+        if n != 3:
+            return None
+        cathy, bob = (me + 2) % n, (me + 1) % n
+        # Command region = Cathy has NO normal play/discard: E is None, or E is a
+        # 1-away finesse (E[3] set). A normal play/discard E means the ordinary
+        # reactive channel applies, so no command. (The finesse is tried first by
+        # the flowchart; this is the discard-initial fallback in the same region.)
+        E_cathy = self._expected_signal(obs, cathy, r, "discard")
+        if E_cathy is not None and E_cathy[3] is None:
+            return None
+        # Bob's slot 1 must be playable -- he blind-plays it as the pass-through.
+        _bslots, bby = self._hand_slots([cv.order for cv in obs.hands[bob]])
+        bs1 = bby.get(1)
+        b1card = next((cv.card for cv in obs.hands[bob] if cv.order == bs1), None)
+        if b1card is None or not obs.is_playable(b1card):
+            return None
+        # Cathy's chop must be worth protecting (critical); else no need to redirect.
+        chand = obs.hands[cathy]
+        corders = [cv.order for cv in chand]
+        cslots, _cby = self._hand_slots(corders)
+        ccard = {cv.order: cv.card for cv in chand}
+        chop = self._chop_order(chand, r)
+        if chop is None or ccard.get(chop) is None or not self._is_critical(obs, ccard[chop]):
+            return None
+        # Safe targets: an unsignalled Cathy card (not the chop) whose identity is
+        # also in Bob's hand -> discarding it keeps Bob's copy, so it's safe.
+        bob_ids = {(cv.card.color, cv.card.rank)
+                   for cv in obs.hands[bob] if cv.card is not None}
+        targets = [cv.order for cv in chand
+                   if cv.order != chop and cv.card is not None
+                   and cv.order not in r.sig_play and cv.order not in r.sig_disc
+                   and (cv.card.color, cv.card.rank) in bob_ids]
+        if not targets:
+            return None
+        in_zone = self._in_endgame(obs.deck_size, sum(obs.play_stacks.values()),
+                                   n, len(obs.colors) * 5)
+        options = [(True, c, None) for c in {cv.card.color for cv in chand}]
+        options += [(False, None, rk) for rk in {cv.card.rank for cv in chand}]
+        # Find a clue (color OR rank) whose initial signal is (discard, target_slot).
+        for target in sorted(targets, key=lambda o: cslots[o]):
+            ts = cslots[target]
+            for is_color, color, rank in options:
+                touched = [cv.order for cv in chand
+                           if (cv.card.color == color if is_color else cv.card.rank == rank)]
+                if not touched:
+                    continue
+                val = color if is_color else rank
+                if self._stall_match(in_zone, is_color, val, touched,
+                                     r.rank_known, r.color_known):
+                    continue  # would read as a stall, not a reaction
+                I = self._compute_initial(corders, touched, r.clued,
+                                          r.color_known, r.rank_known, is_color)
+                if I is not None and I[0] == "discard" and I[1] == ts:
+                    return (Action.clue_color(cathy, color) if is_color
+                            else Action.clue_rank(cathy, rank))
+        return None
+
     def _reactive_clue(self, obs: Observation, r: _Derived,
                        want: str | None = None) -> Action | None:
         """Best available reactive clue, or None. ``want`` filters by category:
@@ -715,25 +881,23 @@ class ReactorPlayer(Player):
         cathy = (me + 2) % n
         bob = (me + 1) % n
 
-        E = self._expected_signal(obs, cathy, r)
-        if E is None:
+        # Expected signal can depend on the clue's initial action; compute both.
+        E_by_action = {"play": self._expected_signal(obs, cathy, r, "play"),
+                       "discard": self._expected_signal(obs, cathy, r, "discard")}
+        if E_by_action["play"] is None and E_by_action["discard"] is None:
             return None
-        e_card = next((cv.card for cv in obs.hands[cathy] if cv.order == E[2]), None)
 
         chand = obs.hands[cathy]
         corders = [cv.order for cv in chand]
 
-        # Giver-side good-touch: if Cathy can already deduce-play a copy of the
-        # card this clue would signal, don't signal it (she'd play the deducible
-        # copy and strike on this one). Alice-only filter; never touches decoding.
-        if self.GOODTOUCH_DEDUCIBLE_DUP and self.ASSUME_TEAMMATES_DEDUCE \
-                and e_card is not None:
-            cathy_deduced_ids = {
-                cv.card for cv in chand
-                if cv.order in self._other_deducible_plays(obs, r, cathy)
-            }
-            if e_card in cathy_deduced_ids:
-                return None
+        # Giver-side good-touch: if Cathy can already deduce-play a copy of the card
+        # a clue would signal, skip that clue (she'd play the deducible copy and
+        # strike on this one). Alice-only filter; never touches decoding.
+        cathy_deduced_ids = (
+            {cv.card for cv in chand
+             if cv.order in self._other_deducible_plays(obs, r, cathy)}
+            if (self.GOODTOUCH_DEDUCIBLE_DUP and self.ASSUME_TEAMMATES_DEDUCE)
+            else set())
         bhand = obs.hands[bob]
         bslots, bby = self._hand_slots([cv.order for cv in bhand])
         bcard = {cv.order: cv.card for cv in bhand}
@@ -751,6 +915,11 @@ class ReactorPlayer(Player):
             (cv.order, (cv.card.color, cv.card.rank))
             for hand in (bhand, chand) for cv in hand
             if cv.order in r.sig_play and cv.card is not None
+        ]
+        signalled_discs = [
+            (cv.order, (cv.card.color, cv.card.rank))
+            for hand in (bhand, chand) for cv in hand
+            if cv.order in r.sig_disc and cv.card is not None
         ]
 
         # Bob's cards he can already prove playable himself: prefer NOT spending
@@ -782,6 +951,12 @@ class ReactorPlayer(Player):
                                       r.color_known, r.rank_known, is_color)
             if I is None:
                 continue
+            E = E_by_action.get(I[0])
+            if E is None:
+                continue
+            e_card = next((cv.card for cv in chand if cv.order == E[2]), None)
+            if e_card is not None and e_card in cathy_deduced_ids:
+                continue
             flip = (I[0] != E[0])
             k = (I[1] - E[1]) % len(chand)  # the slide wraps around the hand
             bslot = 1 + k
@@ -812,6 +987,10 @@ class ReactorPlayer(Player):
                     continue  # Bob couldn't discard
                 if not self._is_trash(obs, order, card, r):
                     continue
+                if (self.REACTION_DISCARD_DEDUP and not obs.is_dead(card)
+                        and any(o != order and ident == (card.color, card.rank)
+                                for o, ident in signalled_discs)):
+                    continue  # its dup is already discard-signalled -> would lose both
 
             if want is not None:
                 if want == "bob_play" and flip:
@@ -867,6 +1046,9 @@ class ReactorPlayer(Player):
         cardof = {cv.order: cv.card for cv in bhand}
         slots, by_slot = self._hand_slots(borders)
         chop_order = by_slot.get(1)
+        # The target's actual chop (leftmost untouched/unsignalled) -- what they'd
+        # discard by default; a discard clue pointing here would be redundant.
+        real_chop = self._chop_order(bhand, r)
 
         # Cards Bob can already prove playable himself -- no need to clue them.
         deducible = (self._other_deducible_plays(obs, r, bob)
@@ -927,6 +1109,11 @@ class ReactorPlayer(Player):
                     continue
                 if any(not self._is_trash(obs, o, cardof[o], r) for o in discs):
                     continue
+                # Redundant "discard your chop" clue -- they'd discard it anyway
+                # (or, with LOCK_CHOP, it's repurposed as a lock, not a plain discard).
+                if ((self.BAN_DISCARD_CHOP_CLUE or self.LOCK_CHOP)
+                        and real_chop is not None and real_chop in discs):
+                    continue
                 # Actual trash before a live duplicate, then leftmost slot.
                 key = (min(self._discard_priority(obs, cardof[o]) for o in discs),
                        min(slots[o] for o in discs))
@@ -937,6 +1124,38 @@ class ReactorPlayer(Player):
                 best = (key, act)
 
         return None if best is None else best[1]
+
+    def _lock_clue(self, obs: Observation, r: _Derived, target: int) -> Action | None:
+        """A stable clue to ``target`` whose discard signal lands exactly on their
+        chop -- decoded (with LOCK_CHOP) as a LOCK that protects the chop. Returns
+        the clue Action, or None if no such clue exists."""
+        if obs.clue_tokens <= 0 or target == obs.player_index:
+            return None
+        thand = obs.hands[target]
+        torders = [cv.order for cv in thand]
+        chop = self._chop_order(thand, r)
+        if chop is None:
+            return None
+        in_zone = self._in_endgame(obs.deck_size, sum(obs.play_stacks.values()),
+                                   obs.num_players, len(obs.colors) * 5)
+        options = [(True, c, None) for c in {cv.card.color for cv in thand}]
+        options += [(False, None, rk) for rk in {cv.card.rank for cv in thand}]
+        for is_color, color, rank in options:
+            touched = [cv.order for cv in thand
+                       if (cv.card.color == color if is_color else cv.card.rank == rank)]
+            if not touched:
+                continue
+            if self._stall_match(in_zone, is_color, color if is_color else rank,
+                                 touched, r.rank_known, r.color_known):
+                continue
+            sig = self._stable_signal_orders(
+                torders, touched, r.clued, r.color_known, r.rank_known,
+                is_color, rank, obs.clue_tokens, obs.max_clue_tokens,
+                r.sig_play, obs.play_stacks, obs.colors)
+            if len(sig) == 1 and sig[0] == (chop, "discard"):
+                return (Action.clue_color(target, color) if is_color
+                        else Action.clue_rank(target, rank))
+        return None
 
     # ==================================================================
     #  Plays / discards driven by our own signals
@@ -1140,6 +1359,20 @@ class ReactorPlayer(Player):
             return None  # trigger: only fires when a discard signal exists
         return self._trash_discard(obs) or Action.discard(best[1])
 
+    def _known_only_view(self, obs: Observation, who: int) -> Observation:
+        """A copy of ``obs`` where ``who``'s cards that ``who`` can't identify are
+        hidden (card=None), so a trash/dup check on it sees only what ``who``
+        actually knows about their own hand (fully-clued singletons). Used to
+        predict ``who``'s clue from ``who``'s knowledge, not the saver's X-ray view."""
+        def hide(cv):
+            if len(cv.possible_colors) == 1 and len(cv.possible_ranks) == 1:
+                return cv
+            return _dc_replace(cv, card=None)
+        new_hands = tuple(
+            tuple(hide(cv) for cv in hand) if p == who else hand
+            for p, hand in enumerate(obs.hands))
+        return _dc_replace(obs, hands=new_hands)
+
     def _is_critical(self, obs: Observation, card) -> bool:
         """True if ``card`` is the last surviving copy of a still-needed card --
         i.e. discarding it makes its suit uncompletable. False for cards already
@@ -1170,7 +1403,10 @@ class ReactorPlayer(Player):
 
     def _chop_order(self, hand, r) -> int | None:
         """The chop (leftmost untouched) order in ``hand`` (a visible hand), or
-        None if every card is clued/signalled. Matches ``_discard_chop``'s target."""
+        None if every card is clued/signalled -- or if the hand is LOCKED (a locked
+        hand won't chop at all). Matches ``_discard_chop``'s target."""
+        if any(cv.order in r.locked for cv in hand):
+            return None
         untouched = [cv.order for cv in hand
                      if cv.order not in r.clued and cv.order not in r.sig_play
                      and cv.order not in r.sig_disc]
@@ -1183,9 +1419,13 @@ class ReactorPlayer(Player):
         if trash is not None:
             return trash
         own = obs.own_hand
+        # A LOCKED hand may not discard its chop at all (until it gets a signal).
+        if any(cv.order in r.locked for cv in own):
+            return None
         slots, _ = self._hand_slots([cv.order for cv in own])
         cands = [(slots[cv.order], i) for i, cv in enumerate(own)
-                 if (not cv.clued) and cv.order not in r.sig_play and cv.order not in r.sig_disc]
+                 if (not cv.clued) and cv.order not in r.sig_play
+                 and cv.order not in r.sig_disc]
         if not cands:
             return None
         cands.sort(reverse=not self.DISCARD_NEWEST_FIRST)

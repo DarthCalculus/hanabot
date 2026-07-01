@@ -555,21 +555,20 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
         if obs.clue_tokens <= 0 or n != 3:
             return []
         cathy, bob = (me + 2) % n, (me + 1) % n
-        E = self._expected_signal(obs, cathy, r)
-        if E is None:
+        # The expected signal can depend on the clue's initial action, so compute
+        # both variants; E_by_action[I[0]] is used per clue. (When
+        # EXPECTED_SIGNAL_BY_INITIAL is off, both are the same signal.)
+        E_by_action = {"play": self._expected_signal(obs, cathy, r, "play"),
+                       "discard": self._expected_signal(obs, cathy, r, "discard")}
+        if E_by_action["play"] is None and E_by_action["discard"] is None:
             return []
         chand = obs.hands[cathy]
         corders = [cv.order for cv in chand]
-        e_card = next((cv.card for cv in chand if cv.order == E[2]), None)
         idmap = {cv.order: (cv.card.color, cv.card.rank)
                  for p in range(n) if p != me
                  for cv in obs.hands[p] if cv.card is not None}
         cathy_ded = self._other_deducible_plays(obs, r, cathy)
-        if E[0] == "play":
-            exp = self._play_value(obs, r, E[2], e_card, cathy_ded, idmap)
-        else:
-            exp = self._discard_value(obs, r, E[2], e_card,
-                                      self._other_deducible_trash(obs, r, cathy))
+        cathy_ded_trash = self._other_deducible_trash(obs, r, cathy)
         bhand = obs.hands[bob]
         bslots, bby = self._hand_slots([cv.order for cv in bhand])
         bcard = {cv.order: cv.card for cv in bhand}
@@ -579,6 +578,9 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
         signalled_plays = [(cv.order, (cv.card.color, cv.card.rank))
                            for hand in (bhand, chand) for cv in hand
                            if cv.order in r.sig_play and cv.card is not None]
+        signalled_discs = [(cv.order, (cv.card.color, cv.card.rank))
+                           for hand in (bhand, chand) for cv in hand
+                           if cv.order in r.sig_disc and cv.card is not None]
         bob_ded = (self._other_deducible_plays(obs, r, bob)
                    if self.ASSUME_TEAMMATES_DEDUCE else set())
         bob_ded_trash = self._other_deducible_trash(obs, r, bob)
@@ -602,6 +604,14 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
                                       r.rank_known, is_color)
             if I is None:
                 continue
+            E = E_by_action.get(I[0])
+            if E is None:
+                continue
+            e_card = next((cv.card for cv in chand if cv.order == E[2]), None)
+            if E[0] == "play":
+                exp = self._play_value(obs, r, E[2], e_card, cathy_ded, idmap)
+            else:
+                exp = self._discard_value(obs, r, E[2], e_card, cathy_ded_trash)
             flip = (I[0] != E[0])
             k = (I[1] - E[1]) % len(chand)
             bslot = 1 + k
@@ -626,6 +636,10 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
                     continue
                 if not self._is_trash(obs, order, card, r):
                     continue
+                if (self.REACTION_DISCARD_DEDUP and not obs.is_dead(card)
+                        and any(o != order and ident == (card.color, card.rank)
+                                for o, ident in signalled_discs)):
+                    continue  # its dup is already discard-signalled -> would lose both
             if not flip:
                 rscore = self._play_value(obs, r, order, card, bob_ded, idmap)
             else:
@@ -656,7 +670,7 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
         any critical chop; otherwise 5s only."""
         if not (self.FIVE_SAVE_ON_CHOP or self.CLUE_OVER_CHOP5
                 or self.CLUE_OVER_CRIT_CHOP or self.CLUE_OVER_PLAYABLE_CHOP
-                or self.CLUE_OVER_TWO_CHOP) \
+                or self.CLUE_OVER_TWO_CHOP or self.LOCK_CHOP) \
                 or obs.clue_tokens < self.CHOP_CLUE_MIN:
             return None
         me, n = obs.player_index, obs.num_players
@@ -695,8 +709,13 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
         if any(o in r.sig_disc for o in bset) or self._other_deducible_trash(obs, r, bob):
             return None
         # 2. Bob has no stable clue to give to Cathy (else he'd clue over chopping).
+        # Predict Bob's clue from BOB's knowledge: the disc branch's trash test must
+        # not count dups in Bob's hidden hand (Bob can't see them), so evaluate it on
+        # a view where Bob's un-identified cards are hidden. (Play branch stays on the
+        # real obs -- its use of Bob's hand is about CATHY's deduction, which is right.)
+        disc_obs = self._known_only_view(obs, bob) if self.COND2_VICTIM_VIEW else obs
         if (self._stable_clue(obs, r, True, giver=bob, target=cathy) is not None
-                or self._stable_clue(obs, r, False, giver=bob, target=cathy) is not None):
+                or self._stable_clue(disc_obs, r, False, giver=bob, target=cathy) is not None):
             return None
         # Trigger holds: any clue over play/discard, 5-save as the last resort.
         options = self._reactive_options(obs, r)
@@ -712,6 +731,12 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
         # dedicated rank-5 save only when the full convention is on and it's a 5
         if self.FIVE_SAVE_ON_CHOP and chop_card.rank == 5:
             return Action.clue_rank(bob, 5)
+        # last resort (cat-4): a LOCK clue -- protect Bob's chop with a repurposed
+        # "discard chop" clue when no normal save clue was available.
+        if self.LOCK_CHOP:
+            lock = self._lock_clue(obs, r, bob)
+            if lock is not None:
+                return lock
         return None
 
     def _bridge_act(self, obs: Observation) -> Action:
@@ -727,7 +752,7 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
         # 1.5 clue over play/discard when Bob's critical/playable chop is in danger
         if (self.FIVE_SAVE_ON_CHOP or self.CLUE_OVER_CHOP5
                 or self.CLUE_OVER_CRIT_CHOP or self.CLUE_OVER_PLAYABLE_CHOP
-                or self.CLUE_OVER_TWO_CHOP):
+                or self.CLUE_OVER_TWO_CHOP or self.LOCK_CHOP):
             fs = self._five_save_action(obs, r)
             if fs is not None:
                 return fs
@@ -761,6 +786,12 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
         # the low-value reactive clue now sits here
         if chosen is not None:
             return chosen[2]
+        # safe-discard command: redirect Cathy off a critical blind-chop (fires only
+        # in the no-normal-signal / finesse region, so a giveable finesse above wins)
+        if self.SAFE_DISCARD_COMMAND:
+            sdc = self._safe_discard_command(obs, r)
+            if sdc is not None:
+                return sdc
         # rest of rdend's flowchart unchanged
         if obs.clue_tokens > 0:
             sp = self._stable_clue(obs, r, want_play=True)
@@ -848,3 +879,63 @@ class ReactorCritPlayChopPlayer(ReactorPtrNoSkipPlayer):
     name = "rdcritplay"
     CLUE_OVER_CRIT_CHOP = True
     CLUE_OVER_PLAYABLE_CHOP = True
+
+
+class ReactorSafeCmdPlayer(ReactorCritPlayChopPlayer):
+    """rdcritplay + the safe-discard command: when Cathy has no normal play/discard
+    and her chop is critical, Alice commands her to discard a card whose duplicate
+    Alice sees in Bob's hand (Bob passes it through by blind-playing slot 1). Fills
+    the dead 'no-normal-E + discard-initial' reactive space. See SAFE_DISCARD_COMMAND."""
+
+    name = "rdcmd"
+    SAFE_DISCARD_COMMAND = True
+
+
+class ReactorByInitPlayer(ReactorSafeCmdPlayer):
+    """rdcmd + the expected signal DEPENDS on the initial signal: a play initial
+    ranks finesse above discard (so a trash no longer blocks a finesse), a discard
+    initial goes play -> discard -> cmd-discard. Alice picks finesse vs discard by
+    clue type when both are available. See EXPECTED_SIGNAL_BY_INITIAL."""
+
+    name = "rdinit"
+    EXPECTED_SIGNAL_BY_INITIAL = True
+
+
+class ReactorCond2ViewPlayer(ReactorByInitPlayer):
+    """rdinit + cond2 predicts the victim's stable clue from the VICTIM's knowledge
+    (Cathy's hand + the victim's own known cards), not the saver's X-ray view of the
+    victim's hidden hand -- so the chop-save stops skipping on clues the victim can't
+    actually give. See COND2_VICTIM_VIEW."""
+
+    name = "rdc2v"
+    COND2_VICTIM_VIEW = True
+
+
+class ReactorReactDiscDedupPlayer(ReactorCond2ViewPlayer):
+    """rdc2v + reaction good-touch on the DISCARD side: a reactive discard reaction
+    won't dump a card whose identity is already discard-signalled on another copy
+    (unless dead), so the two copies aren't both discarded. See REACTION_DISCARD_DEDUP."""
+
+    name = "rdrdd"
+    REACTION_DISCARD_DEDUP = True
+
+
+class ReactorNoChopDiscardPlayer(ReactorReactDiscDedupPlayer):
+    """REJECTED experiment (kept for reference; -1.16pp vs rdrdd). Bans the stable
+    discard clue that points at the target's chop -- turns out that clue isn't
+    redundant (it still touches/protects the other rank cards), so banning it hurts.
+    See BAN_DISCARD_CHOP_CLUE."""
+
+    name = "rdncd"
+    BAN_DISCARD_CHOP_CLUE = True
+
+
+class ReactorLockPlayer(ReactorReactDiscDedupPlayer):
+    """REJECTED experiment (kept for reference; -1.37pp vs rdrdd). Repurposes the
+    "discard chop" stable clue as a LOCK: in cat-4 (Bob's critical chop in danger,
+    no normal save clue) Alice locks Bob's chop; a locked hand may not chop until it
+    gets another signal. It does protect criticals, but the repurposing cost plus
+    the stall/token drag outweigh it. See LOCK_CHOP / _Derived.locked."""
+
+    name = "rdlock"
+    LOCK_CHOP = True
