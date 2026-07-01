@@ -30,6 +30,7 @@ from .players.reactor_deduce_player import (
     ReactorBridgePlayer,
     ReactorBridge4Player,
     ReactorPtrNoSkipPlayer,
+    ReactorCritPlayChopPlayer,
 )
 from .players.reactor_player import ReactorPlayer
 from .players.tempo_player import TempoPlayer
@@ -76,6 +77,7 @@ STRATEGIES: dict[str, PlayerFactory] = {
     "rdbridge": lambda ctx: ReactorBridgePlayer(),
     "rdbridge4": lambda ctx: ReactorBridge4Player(),
     "rdptrnoskip": lambda ctx: ReactorPtrNoSkipPlayer(),
+    "rdcritplay": lambda ctx: ReactorCritPlayChopPlayer(),
 }
 
 # Guard against a strategy that never makes progress.

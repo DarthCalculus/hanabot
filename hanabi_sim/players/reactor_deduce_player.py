@@ -647,6 +647,73 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
         return self._reactive_key(obs, flip, bslot, k, leftmost_nopsig, dprio,
                                   redundant)
 
+    def _five_save_action(self, obs: Observation, r) -> Action | None:
+        """When Bob's chop is a critical card he'd blind-discard and Alice has no
+        reaction to make, give a clue over playing/discarding. Prefer any normal
+        clue (it makes Bob act on it instead of chopping); with FIVE_SAVE_ON_CHOP
+        it falls back to a dedicated stable rank-5 '5-save' when the chop is a 5.
+        Returns None when the trigger doesn't hold. Scope: CLUE_OVER_CRIT_CHOP =>
+        any critical chop; otherwise 5s only."""
+        if not (self.FIVE_SAVE_ON_CHOP or self.CLUE_OVER_CHOP5
+                or self.CLUE_OVER_CRIT_CHOP or self.CLUE_OVER_PLAYABLE_CHOP
+                or self.CLUE_OVER_TWO_CHOP) \
+                or obs.clue_tokens < self.CHOP_CLUE_MIN:
+            return None
+        me, n = obs.player_index, obs.num_players
+        if n != 3:
+            return None
+        bob, cathy = (me + 1) % n, (me + 2) % n
+        # 3. Alice must not need to react.
+        if r.pending is not None and (r.pending[0] + 1) % n == me:
+            return None
+        # Bob's chop must be worth saving (any critical card, or a 5).
+        chop = self._chop_order(obs.hands[bob], r)
+        if chop is None:
+            return None
+        bcard = {cv.order: cv.card for cv in obs.hands[bob]}
+        chop_card = bcard.get(chop)
+        if chop_card is None:
+            return None
+        if self.CLUE_OVER_CRIT_CHOP:
+            worth = self._is_critical(obs, chop_card)
+        else:  # FIVE_SAVE_ON_CHOP / CLUE_OVER_CHOP5: 5s only
+            worth = chop_card.rank == 5
+        # ...also a playable chop with no visible duplicate (a wasted ready point).
+        if not worth and self.CLUE_OVER_PLAYABLE_CHOP:
+            worth = (obs.is_playable(chop_card)
+                     and not self._card_seen_in_other_hand(obs, chop, chop_card))
+        # ...also a rank-2 whose other copy Alice can't see (early suit insurance).
+        if not worth and self.CLUE_OVER_TWO_CHOP:
+            worth = (chop_card.rank == 2
+                     and not self._card_seen_in_other_hand(obs, chop, chop_card))
+        if not worth:
+            return None
+        # 1. Bob has no play / deducible play / discard / deducible discard.
+        bset = {cv.order for cv in obs.hands[bob]}
+        if any(o in r.sig_play for o in bset) or self._other_deducible_plays(obs, r, bob):
+            return None
+        if any(o in r.sig_disc for o in bset) or self._other_deducible_trash(obs, r, bob):
+            return None
+        # 2. Bob has no stable clue to give to Cathy (else he'd clue over chopping).
+        if (self._stable_clue(obs, r, True, giver=bob, target=cathy) is not None
+                or self._stable_clue(obs, r, False, giver=bob, target=cathy) is not None):
+            return None
+        # Trigger holds: any clue over play/discard, 5-save as the last resort.
+        options = self._reactive_options(obs, r)
+        chosen = self._select(options) if options else None
+        if chosen is not None:
+            return chosen[2]
+        sp = self._stable_clue(obs, r, want_play=True)
+        if sp is not None:
+            return sp
+        sd = self._stable_clue(obs, r, want_play=False)
+        if sd is not None:
+            return sd
+        # dedicated rank-5 save only when the full convention is on and it's a 5
+        if self.FIVE_SAVE_ON_CHOP and chop_card.rank == 5:
+            return Action.clue_rank(bob, 5)
+        return None
+
     def _bridge_act(self, obs: Observation) -> Action:
         r = self._derive(obs)
         me, n = obs.player_index, obs.num_players
@@ -657,6 +724,13 @@ class ReactorBridgePlayer(ReactorScoredPlayer):
                 react = self._react(obs, r, r.pending)
                 if react is not None:
                     return react
+        # 1.5 clue over play/discard when Bob's critical/playable chop is in danger
+        if (self.FIVE_SAVE_ON_CHOP or self.CLUE_OVER_CHOP5
+                or self.CLUE_OVER_CRIT_CHOP or self.CLUE_OVER_PLAYABLE_CHOP
+                or self.CLUE_OVER_TWO_CHOP):
+            fs = self._five_save_action(obs, r)
+            if fs is not None:
+                return fs
         # 2. play (deduced, then signalled)
         for play in (self._extra_play(obs, r), self._play_signaled(obs, r)):
             if play is not None:
@@ -749,3 +823,28 @@ class ReactorPtrNoSkipPlayer(ReactorBridge4Player):
 
     name = "rdptrnoskip"
     DISCARD_PTR_SKIP_NEW = False
+
+
+class ReactorCritPlayChopPlayer(ReactorPtrNoSkipPlayer):
+    """CURRENT BEST (~80.75%). rdptrnoskip + "clue over play/discard when the next
+    player would blind-discard a card worth saving": Alice gives a normal clue
+    (over her own play/discard) whenever Bob would chop a CRITICAL card (last copy
+    of a still-needed card) or a currently-PLAYABLE card with no visible duplicate
+    -- the clue makes him act on it instead of chopping. Plus today's deduction /
+    expected-signal fixes on the base (DEDUCE_OWN_KNOWN, EXPECTED_DEDUP_SIGNAL).
+
+    Lineage / A/B (20k, vs rdptrnoskip 78.82%): forcing a clue on a doomed chop-5
+    only (CLUE_OVER_CHOP5, "rd5force") = 79.99% (+1.18pp, the bulk); generalize to
+    any critical chop (CLUE_OVER_CRIT_CHOP, "rdcritclue") = 80.08%; + playable-no-dup
+    (CLUE_OVER_PLAYABLE_CHOP, this) = 80.34% and the best mean; + own-known deduction
+    = 80.41%; + clean expected signal = 80.75%. All 0% strikeout.
+
+    Pruned/parked (flags kept on the base w/ notes): the full rank-5 "5-save"
+    CONVENTION (FIVE_SAVE_ON_CHOP, "rd5save" 80.47%) -- dropped as too much mental
+    effort for human partners; BAN_STABLE_5_ON_CHOP (-0.34pp, measurement only);
+    CHOP_CLUE_MIN>1 ("rdcritplay2", neutral); CLUE_OVER_TWO_CHOP ("rdcritplaytwo",
+    neutral-to-negative)."""
+
+    name = "rdcritplay"
+    CLUE_OVER_CRIT_CHOP = True
+    CLUE_OVER_PLAYABLE_CHOP = True

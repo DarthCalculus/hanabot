@@ -22,6 +22,7 @@ from .reactor_deduce_player import (
     ReactorBridgePlayer,
     ReactorBridge4Player,
     ReactorPtrNoSkipPlayer,
+    ReactorCritPlayChopPlayer,
 )
 from .reactor_player import ReactorPlayer
 from .tempo_player import TempoPlayer
@@ -50,4 +51,5 @@ __all__ = [
     "ReactorBridgePlayer",
     "ReactorBridge4Player",
     "ReactorPtrNoSkipPlayer",
+    "ReactorCritPlayChopPlayer",
 ]

@@ -11,3 +11,9 @@ venv/
 
 # generated game replays (re-create with `python -m hanabi_sim --replay ...`)
 *.html
+
+# live-bot local files (manage_bots.ps1 names the bot accounts -> credentials)
+manage_bots.ps1
+*.log
+*.err
+.botpids.txt

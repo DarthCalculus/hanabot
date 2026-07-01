@@ -146,6 +146,52 @@ class ReactorPlayer(Player):
     #: clue touches can itself be the discard target.
     DISCARD_PTR_SKIP_NEW = True
 
+    #: When True, refuse to GIVE a stable rank-5 clue that touches Bob's leftmost
+    #: (slot-1 / chop) card, except at max tokens or in the endgame. Used to
+    #: measure (and later repurpose) the value of that clue space for 5-saves.
+    BAN_STABLE_5_ON_CHOP = False
+
+    #: When True, a stable rank-5 clue that touches the target's chop is a "5-save":
+    #: it carries NO discard signal, just marks the chop as a 5 (so it stops being
+    #: chop). Alice gives it as a last resort when Bob's chop-5 would otherwise be
+    #: blind-discarded and no other clue is available.
+    FIVE_SAVE_ON_CHOP = False
+
+    #: When True, run only the *encode* half of the 5-save trigger: Alice gives a
+    #: normal clue over playing/discarding when Bob's chop-5 is in danger, but with
+    #: NO dedicated rank-5 save and NO decode change (rank-5 stays a normal stable
+    #: clue). Isolates the value of "forcing a clue" from the save convention.
+    CLUE_OVER_CHOP5 = False
+
+    #: Like CLUE_OVER_CHOP5 but the trigger fires for ANY critical chop (last
+    #: surviving copy of a still-needed card), not just 5s. No dedicated save / no
+    #: decode change -- Alice just gives a normal clue over playing/discarding.
+    CLUE_OVER_CRIT_CHOP = False
+
+    #: Also fire the clue-over-play/discard trigger when Bob's chop is currently
+    #: PLAYABLE and Alice sees no other copy of it in a teammate's hand (so a blind
+    #: discard would waste a ready point). Combines with the critical trigger.
+    CLUE_OVER_PLAYABLE_CHOP = False
+
+    #: Minimum clue tokens required to fire the chop clue-over-play/discard trigger.
+    #: Default 1 (any clue). Set to 2 to avoid spending the LAST clue on a save.
+    CHOP_CLUE_MIN = 1
+
+    #: Also fire the trigger when Bob's chop is a rank-2 whose other copy Alice
+    #: can't see in a teammate's hand (both 2s of a suit lost = suit stuck early).
+    CLUE_OVER_TWO_CHOP = False
+
+    #: In own-hand card-counting, treat a sibling card clued down to a single
+    #: identity (e.g. our own known Y5) as consuming that copy, so a second rank-5
+    #: can rule out yellow. Sound (a pinned card is certain). See _remaining_identities.
+    DEDUCE_OWN_KNOWN = True
+
+    #: Clean signal-aware expected signal: NEVER pick a card that already has any
+    #: signal; and for duplicates, a signalled copy makes its twin eligible only
+    #: for the OPPOSITE signal (play-signalled twin => discard; discard-signalled
+    #: twin => play) and ineligible for the same. See _expected_signal.
+    EXPECTED_DEDUP_SIGNAL = True
+
     # ==================================================================
     #  Turn entry point
     # ==================================================================
@@ -316,6 +362,17 @@ class ReactorPlayer(Player):
         if (self.EIGHT_CLUE_STALL and self.EIGHT_CLUE_STALL_STABLE and (not is_color)
                 and rank in self.EIGHT_CLUE_STALL_RANKS and clue_tokens == max_tok):
             return []
+
+        # 5-save: a rank-5 stable clue that touches the target's chop (leftmost
+        # untouched card) carries no signal -- it just marks the 5, which stops it
+        # being the chop, so the target holds it and acts elsewhere.
+        if self.FIVE_SAVE_ON_CHOP and (not is_color) and rank == 5:
+            untouched = [o for o in orders
+                         if o not in clued_before and o not in sig_play]
+            if untouched:
+                chop = max(untouched) if self.DISCARD_NEWEST_FIRST else min(untouched)
+                if chop in touched:
+                    return []
 
         I = self._compute_initial(orders, touched, clued_before, color_known,
                                   rank_known, is_color)
@@ -496,13 +553,22 @@ class ReactorPlayer(Player):
         hand = obs.hands[who]
         slots, _ = self._hand_slots([cv.order for cv in hand])
 
-        # Identities already signalled-to-play *within this hand* (both see them).
+        # Identities already signalled within this hand (both Alice and Bob see
+        # them). A play-signalled identity => its unsignalled twin is a discard,
+        # not a play; a discard-signalled identity => its twin is a play, not a
+        # discard. The expected signal is NEVER a card that already has a signal.
         psig_ids = {(cv.card.color, cv.card.rank) for cv in hand
                     if cv.order in r.sig_play and cv.card is not None}
+        dsig_ids = {(cv.card.color, cv.card.rank) for cv in hand
+                    if cv.order in r.sig_disc and cv.card is not None}
 
         def signalled(o):
+            if self.EXPECTED_DEDUP_SIGNAL:
+                return o in r.sig_play or o in r.sig_disc  # never re-target a signalled card
             return o in r.sig_play or (self.EXPECTED_SKIP_SIGNALLED and o in r.sig_disc)
 
+        # PLAY tier: leftmost unsignalled playable whose identity isn't already
+        # play-signalled elsewhere (that twin will play; this copy would be a discard).
         best = None
         for cv in hand:
             if cv.card is None or not obs.is_playable(cv.card):
@@ -517,12 +583,20 @@ class ReactorPlayer(Player):
         if best is not None:
             return best
 
+        # DISCARD tier: leftmost unsignalled trash/duplicate whose identity isn't
+        # already discard-signalled elsewhere (that twin will be discarded, so this
+        # copy is a play, not a discard).
         trash = None
         for cv in hand:
             if cv.card is None:
                 continue
-            if self.EXPECTED_SKIP_SIGNALLED and (cv.order in r.sig_play
-                                                 or cv.order in r.sig_disc):
+            if self.EXPECTED_DEDUP_SIGNAL:
+                if signalled(cv.order):
+                    continue
+                if (cv.card.color, cv.card.rank) in dsig_ids:
+                    continue
+            elif self.EXPECTED_SKIP_SIGNALLED and (cv.order in r.sig_play
+                                                   or cv.order in r.sig_disc):
                 continue  # already signalled -- re-signalling conveys nothing
             dead = obs.is_dead(cv.card)
             dup_in_hand = any(o.order != cv.order and o.card == cv.card for o in hand)
@@ -781,16 +855,18 @@ class ReactorPlayer(Player):
     # ==================================================================
     #  Giving a stable clue (we are Alice, target = Bob)
     # ==================================================================
-    def _stable_clue(self, obs: Observation, r: _Derived, want_play: bool) -> Action | None:
-        me = obs.player_index
+    def _stable_clue(self, obs: Observation, r: _Derived, want_play: bool,
+                     giver: int | None = None, target: int | None = None) -> Action | None:
         n = obs.num_players
-        bob = (me + 1) % n
+        me = obs.player_index if giver is None else giver
+        bob = (me + 1) % n if target is None else target
         if bob == me:
             return None
         bhand = obs.hands[bob]
         borders = [cv.order for cv in bhand]
         cardof = {cv.order: cv.card for cv in bhand}
-        slots, _ = self._hand_slots(borders)
+        slots, by_slot = self._hand_slots(borders)
+        chop_order = by_slot.get(1)
 
         # Cards Bob can already prove playable himself -- no need to clue them.
         deducible = (self._other_deducible_plays(obs, r, bob)
@@ -802,9 +878,16 @@ class ReactorPlayer(Player):
         options += [(False, None, rk) for rk in {cv.card.rank for cv in bhand}]
 
         best = None
+        # Reserve "stable rank-5 touching the chop" (except at max tokens / in the
+        # endgame, where rank-5 is a stall / endgame clue anyway).
+        ban_five_chop = (self.BAN_STABLE_5_ON_CHOP and chop_order is not None
+                         and obs.clue_tokens != obs.max_clue_tokens and not in_zone)
+
         for is_color, color, rank in options:
             touched = [cv.order for cv in bhand
                        if (cv.card.color == color if is_color else cv.card.rank == rank)]
+            if ban_five_chop and not is_color and rank == 5 and chop_order in touched:
+                continue
             # A clue that reads as an endgame stall can't carry a signal.
             if self._stall_match(in_zone, is_color, color if is_color else rank,
                                  touched, r.rank_known, r.color_known):
@@ -945,16 +1028,26 @@ class ReactorPlayer(Player):
                 out.add(cv.order)
         return out
 
-    @staticmethod
-    def _remaining_identities(obs: Observation, i: int, elsewhere: dict) -> list:
+    def _remaining_identities(self, obs: Observation, i: int, elsewhere: dict) -> list:
         """Identities own-hand card ``i`` could still be: its clue possibilities
         minus any identity whose every copy is already accounted for elsewhere.
         The card's true identity is always retained (its own copy isn't counted),
-        so this is sound -- it never eliminates the real card."""
+        so this is sound -- it never eliminates the real card.
+
+        ``elsewhere`` omits our own hand (we usually can't see it), but a sibling
+        card we've clued down to a *single* identity (e.g. our own known Y5) is
+        certain, so it consumes that copy too -- letting a second rank-5 rule out
+        yellow. Gated by DEDUCE_OWN_KNOWN."""
         cv = obs.own_hand[i]
+        own: dict = {}
+        if self.DEDUCE_OWN_KNOWN:
+            for j, o in enumerate(obs.own_hand):
+                if j != i and len(o.possible_colors) == 1 and len(o.possible_ranks) == 1:
+                    k = (next(iter(o.possible_colors)), next(iter(o.possible_ranks)))
+                    own[k] = own.get(k, 0) + 1
         return [(c, rank)
                 for c in cv.possible_colors for rank in cv.possible_ranks
-                if elsewhere.get((c, rank), 0) < RANK_COUNTS[rank]]
+                if elsewhere.get((c, rank), 0) + own.get((c, rank), 0) < RANK_COUNTS[rank]]
 
     def _last_turn_gamble(self, obs: Observation) -> Action | None:
         """On a final-round turn (deck empty), if our exact hand provably holds a
@@ -1046,6 +1139,44 @@ class ReactorPlayer(Player):
         if best is None:
             return None  # trigger: only fires when a discard signal exists
         return self._trash_discard(obs) or Action.discard(best[1])
+
+    def _is_critical(self, obs: Observation, card) -> bool:
+        """True if ``card`` is the last surviving copy of a still-needed card --
+        i.e. discarding it makes its suit uncompletable. False for cards already
+        played, cards with a copy still alive, and cards whose suit is already
+        dead below them (those are trash, not critical)."""
+        c, rank = card.color, card.rank
+        if rank <= obs.play_stacks[c]:
+            return False  # already played
+        if sum(1 for d in obs.discard_pile if d == card) < RANK_COUNTS[rank] - 1:
+            return False  # another copy still survives
+        for rr in range(obs.play_stacks[c] + 1, rank):
+            if sum(1 for d in obs.discard_pile
+                   if d.color == c and d.rank == rr) >= RANK_COUNTS[rr]:
+                return False  # suit dead below -> this card is already trash
+        return True
+
+    def _card_seen_in_other_hand(self, obs: Observation, exclude_order: int, card) -> bool:
+        """True if a copy of ``card`` sits in a teammate's hand (visible to us),
+        other than ``exclude_order``. Our own hand is hidden, so never counted."""
+        me = obs.player_index
+        for p in range(obs.num_players):
+            if p == me:
+                continue
+            for cv in obs.hands[p]:
+                if cv.order != exclude_order and cv.card is not None and cv.card == card:
+                    return True
+        return False
+
+    def _chop_order(self, hand, r) -> int | None:
+        """The chop (leftmost untouched) order in ``hand`` (a visible hand), or
+        None if every card is clued/signalled. Matches ``_discard_chop``'s target."""
+        untouched = [cv.order for cv in hand
+                     if cv.order not in r.clued and cv.order not in r.sig_play
+                     and cv.order not in r.sig_disc]
+        if not untouched:
+            return None
+        return max(untouched) if self.DISCARD_NEWEST_FIRST else min(untouched)
 
     def _discard_chop(self, obs: Observation, r: _Derived) -> Action | None:
         trash = self._trash_discard(obs)
